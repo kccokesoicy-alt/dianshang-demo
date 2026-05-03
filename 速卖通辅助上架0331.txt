@@ -1,0 +1,2429 @@
+import os
+import shutil
+import time
+import re
+import uuid
+import requests
+import threading
+import ctypes
+import traceback
+import sys
+import csv
+import math
+from datetime import datetime
+from io import BytesIO
+from collections import defaultdict
+
+import openpyxl
+from openpyxl.drawing.image import Image as xlImage
+from openpyxl.styles import Alignment, Font
+
+import urllib3
+
+import subprocess
+import shutil
+
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 🌟 OpenCV 和 Numpy 柔性导入防崩机制
+try:
+    import cv2
+    import numpy as np
+
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+# PyQt5 核心库
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QTextEdit,
+                             QMessageBox, QProgressBar, QDialog, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QFileDialog, QComboBox,
+                             QDoubleSpinBox, QCheckBox, QGroupBox, QFormLayout, QLineEdit,
+                             QTabWidget)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QSize, QSettings
+from PyQt5.QtGui import QColor, QPixmap, QIcon
+
+# Selenium 库
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+
+# 🛡️ 核心护甲：全局防闪退拦截器
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    err_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"【拦截到致命异常，已防止闪退】\n{err_msg}", file=sys.stderr)
+    try:
+        log_path = os.path.join(os.path.expanduser("~"), 'Desktop', '速卖通工具_崩溃日志.txt')
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now()}]\n{err_msg}\n")
+    except:
+        pass
+
+
+sys.excepthook = global_exception_handler
+
+
+# ==============================================================================
+# 1. 配置管理中心与动态算价引擎
+# ==============================================================================
+class Config:
+    IMG_SOURCE_DIR = r"d:\Desktop\1A临时图"
+    ADV_IMG_SOURCE_DIR = r"d:\Desktop\2A临时图"
+    DESKTOP_DIR = r"d:\Desktop"
+    CHROMEDRIVER_PATH = r"D:\chromedriver-win64(2)\chromedriver-win64\chromedriver.exe"
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+    ERP_USER = os.getenv("ERP_USER", "hyz")
+    ERP_PASS = os.getenv("ERP_PASS", "hyz123")
+    RINHOO_USER = os.getenv("RINHOO_USER", "songjiajia")
+    RINHOO_PASS = os.getenv("RINHOO_PASS", "songjiajia123")
+
+    URLS = {
+        "rinhoo_login": "https://admin.rinhoo1688.com/index.php?c=xdoor&a=login",
+        "rinhoo_search": "https://admin.rinhoo1688.com/index.php?c=cbdepot&a=img_sku_list&sku_id=0&sku_sch_btn=",
+        "erp_login": "http://47.111.187.138",
+        "erp_list": "http://47.111.187.138/index.php/goods/list"
+    }
+
+    CATEGORY_URLS = {
+        "项链": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005010434172297&channelId=45541",
+        "手链": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005008046179229&channelId=45541",
+        "手镯，臂环": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005009013234180&channelId=45541",
+        "腰链": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005009040440485&channelId=45541",
+        "套装": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005010795981238&channelId=45541",
+        "耳钉": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005010811395675&channelId=45541",
+        "脚链": "https://csp.aliexpress.com/ait/cn_pop/item_product/product_publish?copyPublish=1&productId=1005011741771785&channelId=45541"
+    }
+
+
+class PriceCalculator:
+    @staticmethod
+    def get_coeffs():
+        try:
+            os.makedirs(r"D:\上架配置", exist_ok=True)
+        except:
+            pass
+        settings = QSettings(r"D:\上架配置\config.ini", QSettings.IniFormat)
+        enabled = settings.value("enabled", False, type=bool)
+        A = float(settings.value("A", 0.17))
+        B = float(settings.value("B", 0.2))
+        C = float(settings.value("C", 1.54))
+        D = float(settings.value("D", 7.0))
+        E = float(settings.value("E", 1.5))
+        F = float(settings.value("F", 0.69))
+        G = float(settings.value("G", 2.0))
+        H = float(settings.value("H", 6.0))
+        I = float(settings.value("I", 0.05))
+        return enabled, A, B, C, D, E, F, G, H, I
+
+    @staticmethod
+    def calc(price, weight):
+        enabled, A, B, C, D, E, F, G, H, I = PriceCalculator.get_coeffs()
+        if not enabled:
+            A, B, C, D, E, F, G, H, I = 0.17, 0.2, 1.54, 7.0, 1.5, 0.69, 2.0, 6.0, 0.05
+
+        p = float(price)
+        w = float(weight)
+
+        if D == 0: D = 7.0
+        if F == 0: F = 0.69
+        if H == 0: H = 6.0
+
+        act_val = round(((A * w + p + B + C) / D) * E, 2)
+        pre_val = round(act_val / F, 2)
+        hp_val = round(p * G / H - I, 2)
+        return act_val, pre_val, hp_val
+
+
+driver_install_lock = threading.Lock()
+
+
+def create_driver():
+    opts = webdriver.ChromeOptions()
+    opts.add_argument('--start-maximized')
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", 'enable-logging'])
+
+    driver_path = Config.CHROMEDRIVER_PATH
+    driver_dir = os.path.dirname(driver_path)
+
+    if not os.path.exists(driver_dir):
+        try:
+            os.makedirs(driver_dir, exist_ok=True)
+        except:
+            pass
+
+    if os.path.exists(driver_path):
+        try:
+            return webdriver.Chrome(service=Service(driver_path), options=opts)
+        except:
+            pass
+
+    print("🔄 [自检] 正在联网获取最新匹配的 ChromeDriver...")
+    with driver_install_lock:
+        try:
+            downloaded_path = ChromeDriverManager().install()
+            shutil.copy2(downloaded_path, driver_path)
+            return webdriver.Chrome(service=Service(driver_path), options=opts)
+        except Exception as e:
+            raise RuntimeError(f"浏览器驱动启动失败: {e}")
+
+
+# ==============================================================================
+# 🌟 全新复活的视觉引擎 (Visual Engine) 用于精准提取模特图
+# ==============================================================================
+class VisualEngine:
+    @staticmethod
+    def normalize_url(url):
+        if not url: return ""
+        return url.split("?")[0].replace("_60x60.jpg", ".jpg").replace("_60x60.jpeg", ".jpeg").strip()
+
+    @staticmethod
+    def download_bytes(url, cookies=None):
+        try:
+            headers = {"User-Agent": Config.USER_AGENT, "Referer": "https://admin.rinhoo1688.com/"}
+            resp = requests.get(VisualEngine.normalize_url(url), headers=headers, cookies=cookies, verify=False,
+                                timeout=5)
+            return resp.content if resp.status_code == 200 else None
+        except:
+            return None
+
+    @staticmethod
+    def bytes_to_cv2(b):
+        if not b or not CV2_AVAILABLE: return None
+        return cv2.imdecode(np.asarray(bytearray(b), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    @staticmethod
+    def classify(cv2_img):
+        if not CV2_AVAILABLE or cv2_img is None: return "unknown"
+        try:
+            gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            borders = [gray[0:10, :], gray[h - 10:h, :], gray[:, 0:10], gray[:, w - 10:w]]
+            border_mean = np.mean([np.mean(b) for b in borders])
+            is_white_bg = border_mean > 210
+
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = cv2.countNonZero(edges) / (h * w)
+
+            if is_white_bg:
+                if edge_density > 0.045:
+                    return "size"
+                else:
+                    return "white_bg"
+
+            # 肤色检测，高概率识别模特
+            hsv = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2HSV)
+            skin_mask = cv2.inRange(hsv, np.array([0, 20, 70]), np.array([20, 255, 255]))
+            if cv2.countNonZero(skin_mask) / (h * w) > 0.08:
+                return "model"
+
+            return "placement"
+        except:
+            return "unknown"
+
+
+# ==============================================================================
+# 2. 爬虫引擎类
+# ==============================================================================
+class ErpCrawler:
+    def __init__(self):
+        self.driver = None
+
+    def login(self):
+        self.driver = create_driver()
+        self.driver.get(Config.URLS['erp_login'])
+        WebDriverWait(self.driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")))
+        inputs = self.driver.find_elements(By.TAG_NAME, "input")
+        [i for i in inputs if i.get_attribute("type") == "text"][0].send_keys(Config.ERP_USER)
+        pwd_input = [i for i in inputs if i.get_attribute("type") == "password"][0]
+        pwd_input.send_keys(Config.ERP_PASS)
+        pwd_input.submit()
+
+        try:
+            WebDriverWait(self.driver, 30).until(EC.staleness_of(pwd_input))
+        except:
+            pass
+        self.driver.get(Config.URLS['erp_list'])
+
+    def fetch_sku_info(self, sku):
+        try:
+            sb = WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.NAME, "sn")))
+            sb.clear()
+            sb.send_keys(sku)
+            sb.submit()
+
+            target_sku_lower = str(sku).strip().lower()
+            pattern = rf"(?<![\w-]){re.escape(target_sku_lower)}(?![\w-])"
+
+            def is_correct_sku_loaded(driver):
+                try:
+                    table_elem = driver.find_element(By.ID, "list")
+                    text = table_elem.text.lower()
+                    if re.search(pattern, text): return True
+                    if any(x in text for x in ["暂无数据", "没有找到", "无记录"]): return "NOT_FOUND"
+                    return False
+                except:
+                    return False
+
+            wait_result = WebDriverWait(self.driver, 15).until(is_correct_sku_loaded)
+            if wait_result == "NOT_FOUND": return {'SKU': sku, 'title': '', 'weight': '0', 'price': '0'}
+
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            clean_name, weight, price = "", "0", "0"
+            data_table = soup.find('table', id='list')
+            if data_table:
+                node = data_table.find(string=re.compile(r"品名[:：]"))
+                if node: clean_name = re.search(r"品名[:：]\s*(.*?)\s*(?:/|$)", node.parent.get_text(strip=True)).group(
+                    1).strip()
+                w_node = data_table.find('font', color="#FB9404", string=re.compile(r"克"))
+                if w_node: weight = ''.join([c for c in w_node.get_text() if c.isdigit() or c == '.'])
+                for p in data_table.find_all('font', color="blue"):
+                    if re.match(r'^\d+(\.\d+)?$', p.get_text(strip=True)): price = p.get_text(); break
+            return {'SKU': sku, 'title': clean_name, 'weight': weight, 'price': price}
+        except:
+            return {'SKU': sku, 'title': '', 'weight': '0', 'price': '0'}
+
+    def close(self):
+        if self.driver: self.driver.quit()
+
+
+class RinhooCrawler:
+    def __init__(self):
+        self.driver = None
+
+    def login(self):
+        self.driver = create_driver()
+        self.driver.get(Config.URLS['rinhoo_login'])
+        WebDriverWait(self.driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input")))
+        self.driver.find_element(By.XPATH, "//input[contains(@placeholder, '用户名')]").send_keys(Config.RINHOO_USER)
+        self.driver.find_element(By.XPATH, "//input[contains(@placeholder, '密码')]").send_keys(Config.RINHOO_PASS)
+        self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").submit()
+        WebDriverWait(self.driver, 30).until(lambda d: "c=cbadmin" in d.current_url)
+        self.driver.get(Config.URLS['rinhoo_search'])
+
+    def search_and_get_page(self, sku):
+        try:
+            sb = WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.ID, "sku_sch_btn")))
+            self.driver.execute_script("arguments[0].value = '';", sb)
+            sb.send_keys(sku)
+            sb.send_keys(Keys.SPACE)
+            sb.send_keys(Keys.BACKSPACE)
+
+            try:
+                menu_item = WebDriverWait(self.driver, 10).until(
+                    EC.visibility_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item")))
+                self.driver.execute_script("arguments[0].click();", menu_item)
+            except:
+                sb.send_keys(Keys.ARROW_DOWN)
+                menu_item = WebDriverWait(self.driver, 10).until(
+                    EC.visibility_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item")))
+                self.driver.execute_script("arguments[0].click();", menu_item)
+
+            pattern = rf"(?<![\w-]){re.escape(str(sku).lower())}(?![\w-])"
+            WebDriverWait(self.driver, 15).until(
+                lambda d: re.search(pattern, d.find_element(By.ID, "left").get_attribute('innerHTML').lower()))
+            return True
+        except:
+            return False
+
+    def get_specific_left_image(self, sku):
+        try:
+            mxp = f"//*[@id='left']//*[contains(text(), '{sku}')]/ancestor::li[1]//*[contains(text(), '附图')]/preceding::img[1]"
+            return self.driver.find_element(By.XPATH, mxp).get_attribute("src").strip()
+        except:
+            try:
+                return self.driver.find_element(By.CSS_SELECTOR, "img.img_sour[is_pmain='0']").get_attribute(
+                    "src").strip()
+            except:
+                return ""
+
+    def get_all_images_for_video(self):
+        """🌟 为视频生成专属抓取：抓取所有附图和右侧详情图"""
+        urls = []
+        try:
+            self.driver.switch_to.frame("iframe_inner_html")
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.5)
+            urls.extend(
+                [i.get_attribute("src") for i in self.driver.find_elements(By.CSS_SELECTOR, "img.img_upload_view")])
+            self.driver.switch_to.default_content()
+        except:
+            self.driver.switch_to.default_content()
+
+        try:
+            imgs = self.driver.find_elements(By.XPATH, "//*[@id='left']//*[contains(text(), '附图')]/preceding::img[1]")
+            urls.extend([i.get_attribute("src") for i in imgs if "rinhoo" in i.get_attribute("src")])
+        except:
+            pass
+
+        return list(set(urls))
+
+    def count_right_detail_images(self):
+        try:
+            imgs = self.driver.find_elements(By.XPATH, "//*[@id='right']//img")
+            if len(imgs) > 0: return len(imgs)
+            fallback = self.driver.find_elements(By.CSS_SELECTOR, ".right img, .detail img, #detail img")
+            return len(fallback)
+        except:
+            return 0
+
+    def close(self):
+        if self.driver: self.driver.quit()
+
+
+# ==============================================================================
+# 3. 后台作业与辅助类
+# ==============================================================================
+class ScrapeWorker(QThread):
+    progress_signal = pyqtSignal(int, int, str)
+    finished_signal = pyqtSignal(str, str)
+    alert_signal = pyqtSignal(str, str, str)
+
+    def __init__(self, sku_list):
+        super().__init__()
+        self.pause_event = threading.Event()
+
+        flat_list = []
+        for line in sku_list:
+            line = line.strip()
+            if not line: continue
+            parts = re.split(r'[,，]', line)
+            for p in parts:
+                if p.strip():
+                    flat_list.append(p.strip())
+        self.sku_list = flat_list
+
+    def run(self):
+        try:
+            c_erp, c_img = ErpCrawler(), RinhooCrawler()
+            t1 = threading.Thread(target=c_erp.login);
+            t2 = threading.Thread(target=c_img.login)
+            t1.start();
+            t2.start();
+            t1.join();
+            t2.join()
+
+            self.alert_signal.emit("info", "防御自检 - 等待验证码",
+                                   "网页已就绪！\n\n请在弹出的浏览器中检查是否需要输入验证码。\n处理完毕后，请点击本窗口的【确定】开始极速爬取！")
+            self.pause_event.wait()
+            self.pause_event.clear()
+
+        except Exception as e:
+            self.finished_signal.emit(f"❌ 登录失败或驱动报错: {e}", "");
+            return
+
+        results = []
+        for idx, sku in enumerate(self.sku_list, 1):
+            self.progress_signal.emit(idx, len(self.sku_list), f"抓取: {sku}")
+            d = c_erp.fetch_sku_info(sku)
+            if c_img.search_and_get_page(sku):
+                d['img_url'] = c_img.get_specific_left_image(sku)
+                d['detail_img_count'] = c_img.count_right_detail_images()
+            else:
+                d['img_url'] = ""
+                d['detail_img_count'] = 0
+            results.append(d)
+
+        try:
+            p = self.export_excel(results)
+            self.finished_signal.emit("✅ 报价单已生成", p)
+        except Exception as e:
+            self.finished_signal.emit(f"❌ 导出异常: {e}", "")
+        finally:
+            c_erp.close();
+            c_img.close()
+
+    def export_excel(self, data_list):
+        wb = openpyxl.Workbook();
+        ws = wb.active
+        ws.append(
+            ["SKU", "价格", "毛重", "POP实际价格", "POP前台溢价", "半托管价格", "中文标题", "图片链接", "英文标题",
+             "详情图数"])
+        for i, d in enumerate(data_list, 2):
+            p = float(d['price']) if d['price'] else 0.0
+            w = float(d['weight']) if d['weight'] else 0.0
+
+            act_val, pre_val, hp_val = PriceCalculator.calc(p, w)
+
+            ws.cell(i, 1, d['SKU'])
+            ws.cell(i, 2, p)
+            ws.cell(i, 3, w)
+            ws.cell(i, 4, act_val)
+            ws.cell(i, 5, pre_val)
+            ws.cell(i, 6, hp_val)
+            ws.cell(i, 7, d['title'])
+            ws.cell(i, 8, d['img_url'])
+            ws.cell(i, 9, "")
+            ws.cell(i, 10, d.get('detail_img_count', 0))
+
+        path = os.path.join(Config.DESKTOP_DIR, f"抓取报价表_{datetime.now().strftime('%m%d_%H%M')}.xlsx")
+        wb.save(path)
+        return path
+
+
+class ImgLoaderThread(QThread):
+    finished = pyqtSignal(int, bytes)
+
+    def __init__(self, r, u):
+        super().__init__();
+        self.r, self.u = r, u
+
+    def run(self):
+        try:
+            if self.u:
+                r = requests.get(self.u, timeout=5, verify=False)
+                if r.status_code == 200: self.finished.emit(self.r, r.content)
+        except:
+            pass
+
+
+# ==============================================================================
+# 🌟 视频生成核心后台作业 (V116.0 纯英文转码 + 优先级兜底修复版 + 线下取图选项)
+# ==============================================================================
+class VideoMakerWorker(QThread):
+    log_sig = pyqtSignal(str)
+    progress_sig = pyqtSignal(int, int)
+    finished_sig = pyqtSignal()
+    alert_sig = pyqtSignal(str, str, str)
+
+    def __init__(self, skus, local_video_source_dir, offline_mode=False):
+        super().__init__()
+        self.skus = skus
+        self.local_video_source_dir = local_video_source_dir
+        self.offline_mode = offline_mode  # 新增属性
+        self.pause_event = threading.Event()
+
+    def determine_allocation(self):
+        k = len(self.skus)
+        alloc = {}
+        if k == 1:
+            alloc[self.skus[0]] = 5
+        elif k == 2:
+            alloc[self.skus[0]] = 3
+            alloc[self.skus[1]] = 2
+        elif 3 <= k <= 6:
+            for s in self.skus: alloc[s] = 2
+        elif 7 <= k <= 11:
+            for i in range(5): alloc[self.skus[i]] = 2
+            for i in range(5, k): alloc[self.skus[i]] = 1
+        else:
+            for i in range(12): alloc[self.skus[i]] = 1
+        return alloc
+
+    def build_video_from_images(self, image_paths, final_output_path):
+        """
+        使用 FFmpeg（若可用）或 OpenCV 将图片合成为视频。
+        参数:
+            image_paths: 图片文件路径列表（按显示顺序）
+            final_output_path: 最终输出的视频文件路径（含 .mp4 扩展名）
+        """
+        if not image_paths:
+            self.log_sig.emit("❌ 无图片可合成")
+            return
+
+        fps = 30
+        duration = 15
+        total_frames = fps * duration
+        frames_per_img = total_frames // len(image_paths)
+
+        # ------------------- 1. 检查 FFmpeg 是否可用 -------------------
+        # 优先使用环境变量查找
+        ffmpeg_path = shutil.which('ffmpeg')
+        if ffmpeg_path is None:
+            # 如果找不到，尝试硬编码路径
+            hardcoded_ffmpeg = r"D:\ffmpeg\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe"
+            if os.path.exists(hardcoded_ffmpeg):
+                ffmpeg_path = hardcoded_ffmpeg
+                use_ffmpeg = True
+            else:
+                use_ffmpeg = False
+        else:
+            use_ffmpeg = True
+        if use_ffmpeg:
+            self.log_sig.emit("🎬 检测到 FFmpeg，将使用 FFmpeg 合成视频")
+        else:
+            self.log_sig.emit("🎬 FFmpeg 未找到，回退到 OpenCV 合成")
+
+        # ------------------- 2. 创建临时工作目录 -------------------
+        temp_work_dir = os.path.join(Config.DESKTOP_DIR, "temp_video_render_zone")
+        os.makedirs(temp_work_dir, exist_ok=True)
+
+        # 为本次合成创建独立子目录（避免并发冲突）
+        session_id = uuid.uuid4().hex
+        frames_dir = os.path.join(temp_work_dir, f"frames_{session_id}")
+        os.makedirs(frames_dir, exist_ok=True)
+
+        # ------------------- 3. 生成帧图片（缩放 + 黑边） -------------------
+        self.log_sig.emit(f"🖼️ 正在生成 {total_frames} 帧图片...")
+        frame_counter = 0
+        try:
+            for img_path in image_paths:
+                if not CV2_AVAILABLE:
+                    # 若 OpenCV 不可用，直接退出
+                    self.log_sig.emit("❌ OpenCV 不可用，无法生成帧图片")
+                    return
+
+                img = cv2.imread(img_path)
+                if img is None:
+                    self.log_sig.emit(f"⚠️ 跳过无法读取的图片: {img_path}")
+                    continue
+
+                h, w = img.shape[:2]
+                scale = min(1080 / w, 1920 / h)
+                nw, nh = int(w * scale), int(h * scale)
+                resized = cv2.resize(img, (nw, nh))
+
+                top = (1920 - nh) // 2
+                bottom = 1920 - nh - top
+                left = (1080 - nw) // 2
+                right = 1080 - nw - left
+
+                frame = cv2.copyMakeBorder(resized, top, bottom, left, right,
+                                           cv2.BORDER_CONSTANT, value=[0, 0, 0])
+
+                # 每张图写入 frames_per_img 次（对应多帧）
+                for _ in range(frames_per_img):
+                    frame_filename = os.path.join(frames_dir, f"frame_{frame_counter:05d}.jpg")
+                    cv2.imwrite(frame_filename, frame)
+                    frame_counter += 1
+
+            if frame_counter == 0:
+                self.log_sig.emit("❌ 没有生成任何有效帧")
+                return
+        except Exception as e:
+            self.log_sig.emit(f"❌ 生成帧图片时出错: {e}")
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            return
+
+        # ------------------- 4. 合成视频 -------------------
+        video_path_with_ext = final_output_path  # 预期为 .mp4
+        success = False
+
+        if use_ffmpeg:
+            try:
+                # 构造 ffmpeg 命令
+                input_pattern = os.path.join(frames_dir, "frame_%05d.jpg")
+                cmd = [
+                    ffmpeg_path,
+                    "-framerate", str(fps),
+                    "-i", input_pattern,
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",  # 提高兼容性
+                    "-y",  # 覆盖输出文件
+                    video_path_with_ext
+                ]
+                self.log_sig.emit(f"⚙️ 运行 FFmpeg: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0:
+                    self.log_sig.emit(f"✅ FFmpeg 合成成功: {os.path.basename(video_path_with_ext)}")
+                    success = True
+                else:
+                    self.log_sig.emit(f"❌ FFmpeg 合成失败，错误码: {result.returncode}")
+                    self.log_sig.emit(f"stderr: {result.stderr}")
+                    # 回退到 OpenCV
+                    use_ffmpeg = False
+            except Exception as e:
+                self.log_sig.emit(f"❌ 调用 FFmpeg 时异常: {e}")
+                use_ffmpeg = False
+
+        if not use_ffmpeg or not success:
+            # 回退到 OpenCV 合成（原逻辑）
+            self.log_sig.emit("🎬 使用 OpenCV 合成视频（回退）")
+            temp_video_path = os.path.join(temp_work_dir, f"temp_{session_id}.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (1080, 1920))
+
+            if not out.isOpened():
+                self.log_sig.emit("❌ OpenCV VideoWriter 打开失败，尝试其他编码器")
+                # 尝试备选编码器
+                codecs = [('avc1', '.mp4'), ('X264', '.mp4'), ('XVID', '.avi')]
+                for codec, ext in codecs:
+                    alt_path = os.path.join(temp_work_dir, f"temp_{session_id}{ext}")
+                    fourcc = cv2.VideoWriter_fourcc(*codec)
+                    out = cv2.VideoWriter(alt_path, fourcc, fps, (1080, 1920))
+                    if out.isOpened():
+                        temp_video_path = alt_path
+                        break
+                if not out.isOpened():
+                    self.log_sig.emit("❌ 所有编码器均不可用，无法生成视频")
+                    shutil.rmtree(frames_dir, ignore_errors=True)
+                    return
+
+            # 按帧顺序写入（帧图片已存在）
+            for i in range(frame_counter):
+                frame_file = os.path.join(frames_dir, f"frame_{i:05d}.jpg")
+                frame = cv2.imread(frame_file)
+                if frame is not None:
+                    out.write(frame)
+            out.release()
+
+            # 移动最终文件
+            try:
+                if os.path.exists(video_path_with_ext):
+                    os.remove(video_path_with_ext)
+                shutil.move(temp_video_path, video_path_with_ext)
+                self.log_sig.emit(f"✅ OpenCV 合成成功: {os.path.basename(video_path_with_ext)}")
+            except Exception as e:
+                self.log_sig.emit(f"❌ OpenCV 保存失败: {e}")
+
+        # ------------------- 5. 清理临时文件 -------------------
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        self.log_sig.emit("🧹 临时帧图片已清理")
+
+    def run(self):
+        if not CV2_AVAILABLE:
+            self.alert_sig.emit("error", "缺少核心依赖",
+                                "视频制作引擎需要 OpenCV 库。\n请在电脑终端(cmd)中运行以下命令安装：\npip install opencv-python numpy")
+            self.finished_sig.emit()
+            return
+
+        try:
+            out_base_dir = os.path.join(Config.DESKTOP_DIR, f"{datetime.now().strftime('%m%d')}")
+            safe_folder_name = "_".join(self.skus)
+            if len(safe_folder_name) > 100: safe_folder_name = safe_folder_name[:90] + "_等多款"
+            video_folder = os.path.join(out_base_dir, safe_folder_name)
+            os.makedirs(video_folder, exist_ok=True)
+            self.log_sig.emit(f"📂 创建视频专属存储目录: {safe_folder_name}")
+
+            # 只有线上模式才需要启动爬虫登录
+            crawler = None
+            if not self.offline_mode:
+                crawler = RinhooCrawler()
+                t = threading.Thread(target=crawler.login)
+                t.start()
+                t.join()
+
+                self.alert_sig.emit("info", "防御自检 - 等待验证码",
+                                    "抓取引擎已就绪！\n\n请检查弹出的浏览器是否需要验证码。\n处理完毕后，请点击本窗口的【确定】开始制作视频！")
+                self.pause_event.wait()
+                self.pause_event.clear()
+                cookies = {c['name']: c['value'] for c in crawler.driver.get_cookies()}
+            else:
+                cookies = {}  # 线下模式不需要 cookies
+
+            allocations = self.determine_allocation()
+            final_images_to_render = []
+
+            total_skus = len(allocations)
+            for idx, (sku, required_count) in enumerate(allocations.items(), 1):
+                self.log_sig.emit(f"📸 处理 SKU: {sku} (需要 {required_count} 张)")
+                self.progress_sig.emit(idx, total_skus)
+
+                got_offline = False
+                # 线下模式：从本地目录获取图片
+                if self.offline_mode and self.local_video_source_dir and os.path.exists(self.local_video_source_dir):
+                    # <--- 修改点开始
+                    # 1. 先尝试精确匹配（原有逻辑）
+                    exact_folder = os.path.join(self.local_video_source_dir, sku)
+                    if os.path.isdir(exact_folder):
+                        sku_folder = exact_folder
+                        self.log_sig.emit(f"📂 使用精确路径: {sku_folder}")
+                    else:
+                        # 2. 精确匹配失败，递归查找包含 SKU 的文件夹
+                        found = None
+                        for root, dirs, files in os.walk(self.local_video_source_dir):
+                            for d in dirs:
+                                if sku in d:  # 可根据需要改为 d.lower() == sku.lower() 实现不区分大小写完全匹配
+                                    found = os.path.join(root, d)
+                                    break
+                            if found:
+                                break
+                        if found:
+                            sku_folder = found
+                            self.log_sig.emit(f"📂 通过递归找到包含 SKU 的文件夹: {sku_folder}")
+                        else:
+                            sku_folder = None
+                            self.log_sig.emit(f"⚠️ SKU {sku} 线下目录不存在（精确路径和递归搜索均未找到）")
+
+                    if sku_folder and os.path.isdir(sku_folder):
+                        img_files = []
+                        for f in os.listdir(sku_folder):
+                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif')):
+                                full_path = os.path.join(sku_folder, f)
+                                if os.path.isfile(full_path):
+                                    img_files.append(full_path)
+                        img_files.sort()
+                        if img_files:
+                            self.log_sig.emit(f"📂 从线下目录获取 {len(img_files)} 张图片")
+                            for i in range(required_count):
+                                src_img = img_files[i % len(img_files)]
+                                temp_path = os.path.join(video_folder, f"temp_{sku}_{i}.jpg")
+                                shutil.copy2(src_img, temp_path)
+                                final_images_to_render.append(temp_path)
+                            got_offline = True
+                        else:
+                            self.log_sig.emit(f"⚠️ SKU {sku} 线下目录无图片，尝试线上抓取")
+                    else:
+                        self.log_sig.emit(f"⚠️ SKU {sku} 线下目录不存在，尝试线上抓取")
+                    # <--- 修改点结束
+
+                # 如果未通过线下获取，且线上模式可用，则进行线上抓取
+                if not got_offline and crawler is not None:
+                    # 原有的线上抓取逻辑（完全保留，仅缩进）
+                    if crawler.search_and_get_page(sku):
+                        raw_urls = crawler.get_all_images_for_video()
+                        pool = defaultdict(list)
+                        for url in raw_urls:
+                            b = VisualEngine.download_bytes(url, cookies)
+                            cv2_img = VisualEngine.bytes_to_cv2(b)
+                            if cv2_img is not None:
+                                cat = VisualEngine.classify(cv2_img)
+                                if cat in ['model', 'placement', 'unknown', 'white_bg']:
+                                    pool[cat].append((url, b))
+
+                        selected_for_sku = []
+                        for cat in ['model', 'placement', 'unknown', 'white_bg']:
+                            for url, b in pool[cat]:
+                                if len(selected_for_sku) < required_count:
+                                    selected_for_sku.append(b)
+                                else:
+                                    break
+                            if len(selected_for_sku) >= required_count:
+                                break
+
+                        # 兜底：如果选中的图片不足，重复第一张
+                        while len(selected_for_sku) > 0 and len(selected_for_sku) < required_count:
+                            selected_for_sku.append(selected_for_sku[0])
+
+                        for j, b in enumerate(selected_for_sku):
+                            temp_path = os.path.join(video_folder, f"temp_{sku}_{j}.jpg")
+                            with open(temp_path, "wb") as f:
+                                f.write(b)
+                            final_images_to_render.append(temp_path)
+                    else:
+                        self.log_sig.emit(f"⚠️ {sku} 在网站未找到，跳过。")
+                elif not got_offline and crawler is None:
+                    # 线下模式且无法获取图片，记录警告
+                    self.log_sig.emit(f"⚠️ {sku} 无法从线下获取图片，且线上模式未启用，已跳过。")
+
+            # 关闭爬虫（仅当 crawler 存在时）
+            if crawler:
+                crawler.close()
+
+            # 视频合成（与原逻辑相同）
+            if final_images_to_render:
+                video_name = f"{safe_folder_name}(1).mp4"
+                video_out_path = os.path.join(video_folder, video_name)
+                self.build_video_from_images(final_images_to_render, video_out_path)
+
+                for p in final_images_to_render:
+                    try:
+                        os.remove(p)
+                    except:
+                        pass
+            else:
+                self.log_sig.emit("❌ 未获取到任何可用图片，合成取消。")
+
+            # 同步本地实拍视频（与原逻辑相同）
+            if self.local_video_source_dir and os.path.exists(self.local_video_source_dir):
+                self.log_sig.emit(f"🔍 启动本地雷达，搜索源视频: {self.local_video_source_dir}")
+                for root, dirs, files in os.walk(self.local_video_source_dir):
+                    folder_name = os.path.basename(root)
+                    matched_skus = [s for s in self.skus if s in folder_name]
+                    if matched_skus:
+                        target_sku = matched_skus[0]
+                        vid_count = 1
+                        for f in files:
+                            if f.lower().endswith(('.mp4', '.mov', '.avi')):
+                                src_vid = os.path.join(root, f)
+                                dest_vid_name = f"{target_sku}实拍({vid_count}){os.path.splitext(f)[1]}"
+                                dest_vid = os.path.join(video_folder, dest_vid_name)
+                                try:
+                                    shutil.copy2(src_vid, dest_vid)
+                                    self.log_sig.emit(f"✨ 成功同步实拍视频: {dest_vid_name}")
+                                    vid_count += 1
+                                except:
+                                    pass
+
+            self.log_sig.emit("\n🎉 视频工坊全部任务圆满结束！")
+
+        except Exception as e:
+            self.log_sig.emit(f"❌ 视频引擎崩溃: {e}\n{traceback.format_exc()}")
+
+        self.finished_sig.emit()
+
+
+# ==============================================================================
+# 🌟 4. 新增 Tab: 视频切片工坊 (已增加线下取图选项)
+# ==============================================================================
+class VideoMakerTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+
+        info_lbl = QLabel("🎬 智能短视频切片工坊 (15秒BGM爆款逻辑)")
+        info_lbl.setStyleSheet("font-size: 18px; font-weight: bold; color: #E91E63; margin-top: 10px;")
+        lay.addWidget(info_lbl)
+
+        self.sku_input = QTextEdit()
+        self.sku_input.setPlaceholderText("此处接收从【预览上架】页面勾选传过来的 SKU 名单...\n也可手动输入。")
+        self.sku_input.setMaximumHeight(100)
+        lay.addWidget(self.sku_input)
+
+        local_dir_lay = QFormLayout()
+        self.local_dir_input = QLineEdit()
+        self.local_dir_input.setPlaceholderText("(选填) 自动寻找该目录下SKU文件夹内的实拍视频并同步归档")
+        btn_local_dir = QPushButton("📂 选择新品源文件夹")
+        btn_local_dir.clicked.connect(self.browse_local)
+        h_lay = QHBoxLayout()
+        h_lay.addWidget(self.local_dir_input)
+        h_lay.addWidget(btn_local_dir)
+        local_dir_lay.addRow("🔍 本地实拍视频雷达区:", h_lay)
+        lay.addLayout(local_dir_lay)
+
+        # 新增线下取图复选框
+        self.cb_offline = QCheckBox("从线下目录获取图片（否则从线上抓取）")
+        self.cb_offline.setChecked(False)  # 默认使用线上抓取
+        self.cb_offline.setToolTip("勾选后，将从“本地实拍视频雷达区”目录下寻找与SKU同名的文件夹，直接使用其中的图片（不经过视觉分类筛选）。")
+        lay.addWidget(self.cb_offline)
+
+        self.btn_start = QPushButton("🔥 一键启动视频合成引擎")
+        self.btn_start.setStyleSheet(
+            "background-color: #2196F3; color: white; font-weight: bold; font-size: 16px; padding: 15px;")
+        self.btn_start.clicked.connect(self.start_video_maker)
+        lay.addWidget(self.btn_start)
+
+        self.pb = QProgressBar()
+        lay.addWidget(self.pb)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet("background-color: #000; color: #0F0; font-family: Consolas;")
+        lay.addWidget(self.log_box)
+
+    def browse_local(self):
+        d = QFileDialog.getExistingDirectory(self, "选择本地视频源", Config.DESKTOP_DIR)
+        if d: self.local_dir_input.setText(d)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def handle_alert(self, level, title, msg):
+        if level == "info":
+            QMessageBox.information(self, title, msg)
+        else:
+            QMessageBox.critical(self, title, msg)
+        if hasattr(self, 'worker'): self.worker.pause_event.set()
+
+    def start_video_maker(self):
+        raw_text = self.sku_input.toPlainText().strip()
+        if not raw_text:
+            QMessageBox.warning(self, "警告", "没有待处理的 SKU！")
+            return
+
+        skus = [s.strip() for s in raw_text.split('\n') if s.strip()]
+        local_dir = self.local_dir_input.text().strip()
+        offline_mode = self.cb_offline.isChecked()  # 获取复选框状态
+
+        self.btn_start.setEnabled(False)
+        self.log_box.clear()
+        self.log_box.append(f">>> 接收到 {len(skus)} 个核心 SKU，启动视觉算法引擎...")
+
+        self.worker = VideoMakerWorker(skus, local_dir, offline_mode)  # 传入 offline_mode
+        self.worker.log_sig.connect(self.append_log)
+        self.worker.progress_sig.connect(lambda c, t: self.pb.setValue(int(c / t * 100) if t > 0 else 0))
+        self.worker.alert_sig.connect(self.handle_alert)
+        self.worker.finished_sig.connect(lambda: self.btn_start.setEnabled(True))
+        self.worker.start()
+
+
+# ==============================================================================
+# 🌟 动态价格配置对话框
+# ==============================================================================
+class CoefficientDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("价格系数动态配置中心")
+        self.resize(400, 350)
+        self.initUI()
+        self.load_settings()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+
+        self.chk_enable = QCheckBox("🔥 启用自定义价格系数 (勾选后覆盖系统默认)")
+        self.chk_enable.setStyleSheet("font-weight: bold; color: #E91E63; margin-bottom: 10px;")
+        lay.addWidget(self.chk_enable)
+
+        self.inputs = {}
+
+        def create_spin(default_val):
+            sb = QDoubleSpinBox()
+            sb.setRange(-999.0, 9999.0)
+            sb.setDecimals(4)
+            sb.setValue(default_val)
+            return sb
+
+        grp1 = QGroupBox("公式1: POP实际价格 = ((A * 重量 + 价格 + B + C) / D) * E")
+        lay1 = QFormLayout(grp1)
+        self.inputs['A'] = create_spin(0.17);
+        lay1.addRow("A (重量系数):", self.inputs['A'])
+        self.inputs['B'] = create_spin(0.2);
+        lay1.addRow("B (基础运费1):", self.inputs['B'])
+        self.inputs['C'] = create_spin(1.54);
+        lay1.addRow("C (基础运费2):", self.inputs['C'])
+        self.inputs['D'] = create_spin(7.0);
+        lay1.addRow("D (汇率/除数):", self.inputs['D'])
+        self.inputs['E'] = create_spin(1.5);
+        lay1.addRow("E (溢价倍数):", self.inputs['E'])
+        lay.addWidget(grp1)
+
+        grp2 = QGroupBox("公式2: POP前台溢价 = POP实际价格 / F")
+        lay2 = QFormLayout(grp2)
+        self.inputs['F'] = create_spin(0.69);
+        lay2.addRow("F (前台除数):", self.inputs['F'])
+        lay.addWidget(grp2)
+
+        grp3 = QGroupBox("公式3: 半托管价格 = 价格 * G / H - I")
+        lay3 = QFormLayout(grp3)
+        self.inputs['G'] = create_spin(2.0);
+        lay3.addRow("G (乘数):", self.inputs['G'])
+        self.inputs['H'] = create_spin(6.0);
+        lay3.addRow("H (除数):", self.inputs['H'])
+        self.inputs['I'] = create_spin(0.05);
+        lay3.addRow("I (减数):", self.inputs['I'])
+        lay.addWidget(grp3)
+
+        btn_box = QHBoxLayout()
+        btn_reset = QPushButton("恢复默认")
+        btn_reset.clicked.connect(self.restore_defaults)
+        btn_save = QPushButton("💾 保存并立刻重算全表")
+        btn_save.setStyleSheet("background-color: #4CAF50; color: white;")
+        btn_save.clicked.connect(self.save_settings)
+        btn_box.addWidget(btn_reset)
+        btn_box.addWidget(btn_save)
+        lay.addLayout(btn_box)
+
+    def load_settings(self):
+        enabled, A, B, C, D, E, F, G, H, I = PriceCalculator.get_coeffs()
+        self.chk_enable.setChecked(enabled)
+        self.inputs['A'].setValue(A)
+        self.inputs['B'].setValue(B)
+        self.inputs['C'].setValue(C)
+        self.inputs['D'].setValue(D)
+        self.inputs['E'].setValue(E)
+        self.inputs['F'].setValue(F)
+        self.inputs['G'].setValue(G)
+        self.inputs['H'].setValue(H)
+        self.inputs['I'].setValue(I)
+
+    def restore_defaults(self):
+        self.inputs['A'].setValue(0.17)
+        self.inputs['B'].setValue(0.2)
+        self.inputs['C'].setValue(1.54)
+        self.inputs['D'].setValue(7.0)
+        self.inputs['E'].setValue(1.5)
+        self.inputs['F'].setValue(0.69)
+        self.inputs['G'].setValue(2.0)
+        self.inputs['H'].setValue(6.0)
+        self.inputs['I'].setValue(0.05)
+
+    def save_settings(self):
+        try:
+            os.makedirs(r"D:\上架配置", exist_ok=True)
+        except:
+            pass
+        settings = QSettings(r"D:\上架配置\config.ini", QSettings.IniFormat)
+        settings.setValue("enabled", self.chk_enable.isChecked())
+        for k, v in self.inputs.items():
+            settings.setValue(k, v.value())
+        self.accept()
+
+
+# ==============================================================================
+# 🌟 0. 狙击手订单驱动引擎 Tab
+# ==============================================================================
+class SniperEngineTab(QWidget):
+    start_crawl_signal = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+
+        top_bar = QFormLayout()
+        self.work_dir_input = QLineEdit(Config.ADV_IMG_SOURCE_DIR)
+        self.work_dir_input.setPlaceholderText("请选择工作总目录 (程序将无限下钻寻找里面的表格和图片)...")
+        btn_dir = QPushButton("📂 选择工作总目录")
+        btn_dir.clicked.connect(self.browse_dir)
+        dir_lay = QHBoxLayout()
+        dir_lay.addWidget(self.work_dir_input)
+        dir_lay.addWidget(btn_dir)
+        top_bar.addRow("🎯 狙击手雷达防区:", dir_lay)
+
+        lay.addLayout(top_bar)
+
+        btn_process = QPushButton("🎯 全盘深潜扫描表格，启动自动狙击！")
+        btn_process.setStyleSheet(
+            "background-color: #E91E63; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        btn_process.clicked.connect(self.run_sniper_engine)
+        lay.addWidget(btn_process)
+
+        mid_lay = QHBoxLayout()
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("狙击战报与质检黑名单将显示在此处...\n")
+
+        self.sku_box = QTextEdit()
+        self.sku_box.setPlaceholderText("命中的 SKU 列表将提取到此处...")
+
+        mid_lay.addWidget(self.log_box, stretch=6)
+        mid_lay.addWidget(self.sku_box, stretch=4)
+        lay.addLayout(mid_lay)
+
+        btn_crawl = QPushButton("⚡ 将命中名单带入【采集中心】并启动爬虫")
+        btn_crawl.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-size: 14px; font-weight: bold; padding: 10px;")
+        btn_crawl.clicked.connect(self.trigger_crawl)
+        lay.addWidget(btn_crawl)
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择工作总目录", Config.DESKTOP_DIR)
+        if d: self.work_dir_input.setText(d)
+
+    def safe_copy(self, src_path, dest_dir, new_name):
+        base, ext = os.path.splitext(new_name)
+        dest_path = os.path.join(dest_dir, new_name)
+        counter = 1
+        while os.path.exists(dest_path):
+            dest_path = os.path.join(dest_dir, f"{base}_{counter}{ext}")
+            counter += 1
+        try:
+            shutil.copy2(src_path, dest_path)
+        except:
+            pass
+
+    def run_sniper_engine(self):
+        work_dir = self.work_dir_input.text()
+        if not os.path.exists(work_dir):
+            QMessageBox.warning(self, "错误", "请提供正确的工作总目录！")
+            return
+
+        self.log_box.clear()
+        self.log_box.append(f">>> [阶段一] 正在全景雷达扫描目录，无限向下挖掘所有表格 (.xlsx, .xls, .csv)...")
+        QApplication.processEvents()
+
+        target_skus = []
+        table_file_paths = []
+
+        for root_dir, dirs, files in os.walk(work_dir):
+            for f in files:
+                if f.lower().endswith(('.xlsx', '.xls', '.csv')) and not f.startswith('~$'):
+                    table_file_paths.append(os.path.join(root_dir, f))
+
+        if not table_file_paths:
+            self.log_box.append("❌ 致命错误：在指定目录及其所有子文件夹下，均未找到任何表格文件！")
+            return
+
+        for file_path in table_file_paths:
+            f_name = os.path.basename(file_path)
+            self.log_box.append(f"📄 正在解析深层暗杀名单: {f_name}")
+            try:
+                if file_path.lower().endswith('.xlsx'):
+                    wb = openpyxl.load_workbook(file_path, data_only=True)
+                    ws = wb.active
+                    for i, row in enumerate(ws.iter_rows(min_col=1, max_col=1, values_only=True)):
+                        if i < 2: continue
+                        val = str(row[0] or "").strip()
+                        if val: target_skus.append(val)
+                elif file_path.lower().endswith('.csv'):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8-sig') as f_csv:
+                            reader = csv.reader(f_csv)
+                            for i, row in enumerate(reader):
+                                if i < 2: continue
+                                if row and row[0].strip(): target_skus.append(row[0].strip())
+                    except UnicodeDecodeError:
+                        with open(file_path, 'r', encoding='gbk') as f_csv:
+                            reader = csv.reader(f_csv)
+                            for i, row in enumerate(reader):
+                                if i < 2: continue
+                                if row and row[0].strip(): target_skus.append(row[0].strip())
+                elif file_path.lower().endswith('.xls'):
+                    try:
+                        import xlrd
+                        wb = xlrd.open_workbook(file_path)
+                        ws = wb.sheet_by_index(0)
+                        for i in range(2, ws.nrows):
+                            val = str(ws.cell_value(i, 0)).strip()
+                            if val: target_skus.append(val)
+                    except ImportError:
+                        self.log_box.append(
+                            f"<span style='color:red;'>⚠️ 警告: 无法读取 {f_name}。请在终端执行 'pip install xlrd' 才能解析旧版 .xls 格式！已自动跳过此表。</span>")
+            except Exception as e:
+                self.log_box.append(f"❌ 读取表格 {f_name} 失败: {e}")
+
+        seen = set()
+        clean_targets = []
+        for line in target_skus:
+            parts = re.split(r'[,，]', line)
+            for p in parts:
+                p = p.strip()
+                if p and p not in seen:
+                    clean_targets.append(p)
+                    seen.add(p)
+        target_skus = clean_targets
+
+        if not target_skus:
+            self.log_box.append("\n❌ 所有表格中均未提取到任何有效的 SKU！")
+            return
+
+        self.log_box.append(f"✅ 成功从所有表格中提取出不重复靶标 SKU 共 {len(target_skus)} 个。\n")
+        self.log_box.append(">>> [阶段二] 正在扫描图库，构建全息地图...")
+        QApplication.processEvents()
+
+        folder_map = {}
+        for root, dirs, files in os.walk(work_dir):
+            for d in dirs:
+                if d.upper() == 'AI': continue
+                clean_name = re.sub(r'[\u4e00-\u9fa5]', '', d).strip()
+                if clean_name:
+                    if clean_name not in folder_map:
+                        folder_map[clean_name] = []
+                    folder_map[clean_name].append(os.path.join(root, d))
+
+        self.log_box.append(f"✅ 全息地图构建完毕，共探测到 {len(folder_map)} 个纯净骨架节点。\n")
+        self.log_box.append(">>> [阶段三] 狙击手出动，按图索骥提取资源并质检...")
+        QApplication.processEvents()
+
+        out_dir = os.path.join(Config.DESKTOP_DIR, f"{datetime.now().strftime('%m%d')}自动寻表狙击汇总")
+        os.makedirs(out_dir, exist_ok=True)
+
+        missing_folders = []
+        missing_ai_skus = []
+        hit_skus = []
+        valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif'}
+
+        for sku in target_skus:
+            if sku not in folder_map:
+                missing_folders.append(sku)
+                self.log_box.append(f"❌ [脱靶] 未找到 SKU 文件夹: {sku}")
+                continue
+
+            paths = folder_map[sku]
+            best_path = None
+            for p in paths:
+                has_img = any(os.path.splitext(f)[1].lower() in valid_exts for f in os.listdir(p) if
+                              os.path.isfile(os.path.join(p, f)))
+                if has_img or os.path.exists(os.path.join(p, 'AI')) or os.path.exists(os.path.join(p, 'ai')):
+                    best_path = p
+                    break
+            if not best_path: best_path = paths[0]
+
+            self.log_box.append(f"🎯 [命中] SKU: {sku} -> 提取自: {os.path.basename(best_path)}")
+            hit_skus.append(sku)
+
+            prod_files = []
+            for f in os.listdir(best_path):
+                fp = os.path.join(best_path, f)
+                if os.path.isfile(fp) and os.path.splitext(f)[1].lower() in valid_exts:
+                    prod_files.append(f)
+            prod_files.sort(key=lambda x: os.path.getsize(os.path.join(best_path, x)))
+
+            for idx, f in enumerate(prod_files, 1):
+                ext = os.path.splitext(f)[1].lower()
+                self.safe_copy(os.path.join(best_path, f), out_dir, f"{sku}系统图({idx}){ext}")
+
+            ai_path = None
+            for item in os.listdir(best_path):
+                if item.upper() == 'AI' and os.path.isdir(os.path.join(best_path, item)):
+                    ai_path = os.path.join(best_path, item)
+                    break
+
+            if not ai_path:
+                ai_path = os.path.join(best_path, 'AI')
+                try:
+                    os.makedirs(ai_path, exist_ok=True)
+                except:
+                    pass
+
+            ai_has_images = False
+            if os.path.exists(ai_path):
+                ai_files = [f for f in os.listdir(ai_path) if
+                            os.path.isfile(os.path.join(ai_path, f)) and os.path.splitext(f)[1].lower() in valid_exts]
+                if ai_files:
+                    ai_has_images = True
+                    ai_files.sort(key=lambda x: os.path.getsize(os.path.join(ai_path, x)))
+                    for idx, f in enumerate(ai_files, 1):
+                        ext = os.path.splitext(f)[1].lower()
+                        self.safe_copy(os.path.join(ai_path, f), out_dir, f"{sku} AI图({idx}){ext}")
+
+            if not ai_has_images:
+                missing_ai_skus.append(sku)
+                self.log_box.append(
+                    f"<span style='color:#FF9800;'>    ⚠️ 警告：SKU [{sku}] 缺失 AI 图，已在源目录自动补建空文件夹。</span>")
+
+        self.sku_box.setText("\n".join(hit_skus))
+
+        self.log_box.append(
+            "\n<span style='color:#9C27B0; font-weight:bold;'>=========================================</span>")
+        self.log_box.append("<span style='color:#9C27B0; font-weight:bold;'>🏆 狙击战报汇总 🏆</span>")
+        self.log_box.append(f"<b>表格总名单：</b> {len(target_skus)} 个")
+        self.log_box.append(f"<b>成功命中提取：</b> {len(hit_skus)} 个 (保存于桌面 {os.path.basename(out_dir)})")
+
+        if missing_folders:
+            self.log_box.append(
+                "\n<span style='color:red; font-weight:bold;'>🚨【严重漏做：表格有写，但本地无文件夹的黑名单】🚨</span>")
+            for m in missing_folders:
+                self.log_box.append(f"<span style='color:red;'>• {m}</span>")
+        else:
+            self.log_box.append(
+                "\n<span style='color:green; font-weight:bold;'>✅ 美工合格：表格中要求的所有 SKU 均有文件夹！</span>")
+
+        if missing_ai_skus:
+            self.log_box.append(
+                "\n<span style='color:#FF9800; font-weight:bold;'>🚨【品控警告：本地有文件夹，但内部缺失 AI 图的清单】🚨</span>")
+            for m in missing_ai_skus:
+                self.log_box.append(f"<span style='color:#FF9800;'>• {m}</span>")
+        else:
+            self.log_box.append(
+                "\n<span style='color:green; font-weight:bold;'>✅ 质量完美：所有命中款均已包含 AI 图片！</span>")
+        self.log_box.append(
+            "<span style='color:#9C27B0; font-weight:bold;'>=========================================</span>")
+
+    def trigger_crawl(self):
+        text = self.sku_box.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "命中名单为空！")
+            return
+        self.start_crawl_signal.emit([s.strip() for s in text.split('\n') if s.strip()])
+
+
+# ==============================================================================
+# 🌟 1. 全景高级图片处理 Tab (云端反哺源文件夹 + 无损保留版)
+# ==============================================================================
+class AdvancedImageWorker(QThread):
+    """独立的异步后台工作线程，防止纯本地整理与云端爬取时导致界面卡死"""
+    log_sig = pyqtSignal(str)
+    finished_sig = pyqtSignal(list, list)  # extracted_skus, missing_ai_skus
+    alert_sig = pyqtSignal(str, str, str)
+
+    def __init__(self, src, out_dir, fetch_online):
+        super().__init__()
+        self.src = src
+        self.out_dir = out_dir
+        self.fetch_online = fetch_online
+        self.pause_event = threading.Event()
+        self.extracted_skus = set()
+        self.missing_ai_skus = []
+        # 🌟 核心新增：记忆每个 SKU 对应的原始文件夹路径
+        self.sku_to_source_path = {}
+
+    def get_images_sorted_by_size(self, folder):
+        valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif'}
+        files = []
+        try:
+            for f in os.listdir(folder):
+                if os.path.isfile(os.path.join(folder, f)):
+                    if os.path.splitext(f)[1].lower() in valid_exts:
+                        files.append(f)
+            return sorted(files, key=lambda x: os.path.getsize(os.path.join(folder, x)))
+        except:
+            return []
+
+    def safe_copy(self, src_path, dest_dir, new_name):
+        base, ext = os.path.splitext(new_name)
+        dest_path = os.path.join(dest_dir, new_name)
+        counter = 1
+        while os.path.exists(dest_path):
+            dest_path = os.path.join(dest_dir, f"{base}_{counter}{ext}")
+            counter += 1
+        try:
+            shutil.copy2(src_path, dest_path)
+        except:
+            pass
+
+    def process_node(self, current_path):
+        if not os.path.isdir(current_path): return
+        folder_name = os.path.basename(current_path)
+        clean_name = re.sub(r'[\u4e00-\u9fa5]', '', folder_name).strip()
+
+        try:
+            sub_dirs = [d for d in os.listdir(current_path) if os.path.isdir(os.path.join(current_path, d))]
+        except:
+            return
+        real_sub_dirs = [d for d in sub_dirs if d.upper() != 'AI']
+
+        is_parent_sku = folder_name.endswith('-') or clean_name.endswith('-')
+        is_leaf_sku = (not is_parent_sku) and (len(real_sub_dirs) == 0)
+        is_series_folder = (not is_parent_sku) and (len(real_sub_dirs) > 0)
+
+        if is_series_folder:
+            self.log_sig.emit(f"📦 [穿透系列包装盒]: {folder_name}")
+            sorted_subs = sorted(real_sub_dirs)
+            first_child_name = sorted_subs[0] if sorted_subs else ""
+            first_child_clean = re.sub(r'[\u4e00-\u9fa5]', '', first_child_name).strip()
+            safe_name_prefix = first_child_clean if first_child_clean else "未知系列"
+
+            imgs = self.get_images_sorted_by_size(current_path)
+            for idx, f in enumerate(imgs, 1):
+                safe_name = f"{safe_name_prefix}全家福({idx})"
+                self.safe_copy(os.path.join(current_path, f), self.out_dir, f"{safe_name}{os.path.splitext(f)[1]}")
+            for sub in sub_dirs:
+                if sub.upper() != 'AI':
+                    self.process_node(os.path.join(current_path, sub))
+
+        elif is_parent_sku:
+            self.log_sig.emit(f"👑 [锁定多变体父级]: {folder_name} -> 父SKU: {clean_name}")
+            first_child_clean = clean_name.strip('-')
+            if real_sub_dirs:
+                sorted_subs = sorted(real_sub_dirs)
+                first_child_clean = re.sub(r'[\u4e00-\u9fa5]', '', sorted_subs[0]).strip() or first_child_clean
+
+            imgs = self.get_images_sorted_by_size(current_path)
+            for idx, f in enumerate(imgs, 1):
+                self.safe_copy(os.path.join(current_path, f), self.out_dir,
+                               f"{first_child_clean}({idx}){os.path.splitext(f)[1]}")
+            for sub in real_sub_dirs:
+                self.process_node(os.path.join(current_path, sub))
+
+        elif is_leaf_sku:
+            self.log_sig.emit(f"💎 [锁定末端单品]: {folder_name} -> SKU: {clean_name}")
+            if clean_name:
+                self.extracted_skus.add(clean_name)
+                # 🌟 核心新增：记录该 SKU 对应的原始路径，为后续反哺图片指路
+                self.sku_to_source_path[clean_name] = current_path
+
+            imgs = self.get_images_sorted_by_size(current_path)
+            for idx, f in enumerate(imgs, 1):
+                self.safe_copy(os.path.join(current_path, f), self.out_dir,
+                               f"{clean_name}系统图({idx}){os.path.splitext(f)[1]}")
+
+            ai_path = None
+            for item in os.listdir(current_path):
+                if item.upper() == 'AI' and os.path.isdir(os.path.join(current_path, item)):
+                    ai_path = os.path.join(current_path, item)
+                    break
+
+            if not ai_path:
+                ai_path = os.path.join(current_path, 'AI')
+                try:
+                    os.makedirs(ai_path, exist_ok=True)
+                except:
+                    pass
+
+            ai_imgs = self.get_images_sorted_by_size(ai_path) if os.path.exists(ai_path) else []
+
+            if len(ai_imgs) > 0:
+                for idx, f in enumerate(ai_imgs, 1):
+                    self.safe_copy(os.path.join(ai_path, f), self.out_dir,
+                                   f"{clean_name} AI图({idx}){os.path.splitext(f)[1]}")
+            else:
+                warning_msg = f"<span style='color:red; font-weight:bold;'>❌ 警告：SKU [{clean_name}] 缺失 AI 图片，已为您自动补建空文件夹！</span>"
+                self.log_sig.emit(warning_msg)
+                self.missing_ai_skus.append(clean_name)
+
+    def run(self):
+        try:
+            self.log_sig.emit(">>> 启动顶级语义树下钻引擎与品控雷达...\n")
+
+            # 1. 纯本地物理节点深度遍历与整理 (已去除销毁源文件夹逻辑)
+            for group in os.listdir(self.src):
+                full_path = os.path.join(self.src, group)
+                if os.path.isdir(full_path):
+                    self.process_node(full_path)
+
+            self.log_sig.emit(f"\n>>> 所有深层节点穿透完毕！源文件已安全保留，整理图归档至: {self.out_dir}")
+
+            # 2. 云端雷达补充实拍图 & 反哺源文件夹
+            if self.fetch_online and self.extracted_skus:
+                self.log_sig.emit(
+                    "\n<span style='color:#2196F3; font-weight:bold;'>>>> [云端雷达启动] 准备前往公司网站提取实拍图...</span>")
+                crawler = RinhooCrawler()
+                crawler.login()
+
+                # 防御性暂停：等待用户手动处理潜在的验证码
+                self.alert_sig.emit("info", "防御自检 - 等待验证码",
+                                    "线上抓取引擎已就绪！\n\n请检查弹出的浏览器是否需要验证码。\n处理完毕后，请点击本窗口的【确定】开始批量抓取公司实拍图！")
+                self.pause_event.wait()
+                self.pause_event.clear()
+
+                cookies = {c['name']: c['value'] for c in crawler.driver.get_cookies()}
+
+                for sku in sorted(list(self.extracted_skus)):
+                    self.log_sig.emit(f"🌐 正在前往云端搜寻 SKU: {sku} ...")
+                    if crawler.search_and_get_page(sku):
+                        urls = crawler.get_all_images_for_video()
+                        if urls:
+                            count = 1
+                            # 获取该 SKU 的原始文件夹路径
+                            original_source_dir = self.sku_to_source_path.get(sku)
+
+                            for url in urls:
+                                b = VisualEngine.download_bytes(url, cookies)
+                                if b:
+                                    ext = ".jpg"
+                                    if ".png" in url.lower():
+                                        ext = ".png"
+                                    elif ".webp" in url.lower():
+                                        ext = ".webp"
+                                    elif ".gif" in url.lower():
+                                        ext = ".gif"
+
+                                    file_name = f"{sku}公司实拍图({count}){ext}"
+
+                                    # 步骤 A：写入桌面汇总文件夹 (保证业务流连续性)
+                                    summary_save_path = os.path.join(self.out_dir, file_name)
+                                    with open(summary_save_path, "wb") as f:
+                                        f.write(b)
+
+                                    # 步骤 B：反哺存回最初的源文件夹 (实现您的新需求)
+                                    if original_source_dir and os.path.exists(original_source_dir):
+                                        source_save_path = os.path.join(original_source_dir, file_name)
+                                        try:
+                                            shutil.copy2(summary_save_path, source_save_path)
+                                        except Exception:
+                                            pass
+
+                                    count += 1
+                            self.log_sig.emit(
+                                f"<span style='color:green;'>✅ 成功获取 {count - 1} 张实拍图 -> 已同步存入汇总文件夹与源文件夹</span>")
+                        else:
+                            self.log_sig.emit(f"<span style='color:#FF9800;'>⚠️ 云端未找到 {sku} 的相关附图</span>")
+                    else:
+                        self.log_sig.emit(f"<span style='color:red;'>❌ 网站中未搜索到 SKU: {sku}</span>")
+
+                crawler.close()
+
+            # 3. 质检报告打印
+            if self.missing_ai_skus:
+                self.log_sig.emit(
+                    "\n<span style='color:red; font-weight:bold;'>=========================================</span>")
+                self.log_sig.emit(
+                    "<span style='color:red; font-weight:bold;'>🚨 质检警报：《缺失 AI 图片的 SKU 汇总清单》 🚨</span>")
+                for m_sku in self.missing_ai_skus:
+                    self.log_sig.emit(f"<span style='color:red;'>• {m_sku}</span>")
+                self.log_sig.emit(
+                    "<span style='color:red; font-weight:bold;'>=========================================</span>")
+            else:
+                self.log_sig.emit(
+                    "\n<span style='color:green; font-weight:bold;'>✅ 质检完美通过：所有底层 SKU 均已包含 AI 图片！</span>")
+
+            # （原有的销毁源文件夹逻辑已完全移除）
+
+            self.finished_sig.emit(sorted(list(self.extracted_skus)), self.missing_ai_skus)
+
+        except Exception as e:
+            self.log_sig.emit(
+                f"\n<span style='color:red; font-weight:bold;'>❌ 发生致命错误: {e}\n{traceback.format_exc()}</span>")
+            self.finished_sig.emit(sorted(list(self.extracted_skus)), self.missing_ai_skus)
+
+
+class AdvancedImageTab(QWidget):
+    start_crawl_signal = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+        top_bar = QHBoxLayout()
+        self.dir_input = QLineEdit(Config.ADV_IMG_SOURCE_DIR)
+        btn_browse = QPushButton("📂 选择目录")
+        btn_browse.clicked.connect(self.browse_dir)
+
+        # 复选框：不仅去取，而且系统会在底层把图也塞回源文件夹
+        self.cb_fetch_online = QCheckBox("🌐 提取并反哺公司实拍图")
+        self.cb_fetch_online.setStyleSheet("font-weight: bold; color: #E91E63; margin-left: 10px; margin-right: 10px;")
+        self.cb_fetch_online.setToolTip(
+            "勾选后，系统会自动前往公司网站下载对应附图，并将图片同时存入【桌面汇总文件夹】和【原始源文件夹】中，原文件夹不会被删除。")
+
+        self.btn_process = QPushButton("🚀 启动全景透视去重")
+        self.btn_process.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 5px;")
+        self.btn_process.clicked.connect(self.process_advanced_images)
+
+        top_bar.addWidget(QLabel("源目录:"))
+        top_bar.addWidget(self.dir_input)
+        top_bar.addWidget(btn_browse)
+        top_bar.addWidget(self.cb_fetch_online)
+        top_bar.addWidget(self.btn_process)
+        lay.addLayout(top_bar)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("雷达穿透、爬虫日志与质检结果将显示在此处...\n")
+
+        self.sku_box = QTextEdit()
+        self.sku_box.setPlaceholderText("提取出的去重 SKU 列表将显示在此处 (支持手动追加子SKU逗号算价)...")
+
+        mid_lay = QHBoxLayout()
+        mid_lay.addWidget(self.log_box, stretch=6)
+        mid_lay.addWidget(self.sku_box, stretch=4)
+        lay.addLayout(mid_lay)
+
+        btn_crawl = QPushButton("⚡ 一键带入【采集中心】并启动爬虫")
+        btn_crawl.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-size: 14px; font-weight: bold; padding: 10px;")
+        btn_crawl.clicked.connect(self.trigger_crawl)
+        lay.addWidget(btn_crawl)
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择源目录", Config.DESKTOP_DIR)
+        if d: self.dir_input.setText(d)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def handle_alert(self, level, title, msg):
+        if level == "info":
+            QMessageBox.information(self, title, msg)
+        else:
+            QMessageBox.critical(self, title, msg)
+        if hasattr(self, 'worker'):
+            self.worker.pause_event.set()
+
+    def process_advanced_images(self):
+        src = self.dir_input.text()
+        if not os.path.exists(src):
+            QMessageBox.warning(self, "错误", "指定目录不存在！")
+            return
+
+        out_dir = os.path.join(Config.DESKTOP_DIR, f"{datetime.now().strftime('%m%d')}整理汇总")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self.log_box.clear()
+        self.btn_process.setEnabled(False)
+
+        fetch_online = self.cb_fetch_online.isChecked()
+
+        self.worker = AdvancedImageWorker(src, out_dir, fetch_online)
+        self.worker.log_sig.connect(self.append_log)
+        self.worker.alert_sig.connect(self.handle_alert)
+        self.worker.finished_sig.connect(self.on_processing_finished)
+        self.worker.start()
+
+    def on_processing_finished(self, skus, missing_ai_skus):
+        self.btn_process.setEnabled(True)
+        self.sku_box.setText("\n".join(skus))
+
+    def trigger_crawl(self):
+        text = self.sku_box.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "SKU 列表为空，请先处理图片！")
+            return
+        self.start_crawl_signal.emit([s.strip() for s in text.split('\n') if s.strip()])
+
+
+class AdvancedImageTab(QWidget):
+    start_crawl_signal = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+        top_bar = QHBoxLayout()
+        self.dir_input = QLineEdit(Config.ADV_IMG_SOURCE_DIR)
+        btn_browse = QPushButton("📂 选择目录")
+        btn_browse.clicked.connect(self.browse_dir)
+
+        # 🌟 新增：云端图库补全复选框
+        self.cb_fetch_online = QCheckBox("🌐 补充公司图库实拍图")
+        self.cb_fetch_online.setStyleSheet("font-weight: bold; color: #E91E63; margin-left: 10px; margin-right: 10px;")
+        self.cb_fetch_online.setToolTip(
+            "勾选后，系统将在本地整理完毕后，自动前往公司网站为您下载对应SKU的附图，并汇入整理目录。")
+
+        self.btn_process = QPushButton("🚀 启动全景透视去重")
+        self.btn_process.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 5px;")
+        self.btn_process.clicked.connect(self.process_advanced_images)
+
+        top_bar.addWidget(QLabel("源目录:"))
+        top_bar.addWidget(self.dir_input)
+        top_bar.addWidget(btn_browse)
+        top_bar.addWidget(self.cb_fetch_online)
+        top_bar.addWidget(self.btn_process)
+        lay.addLayout(top_bar)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("雷达穿透、爬虫日志与质检结果将显示在此处...\n")
+
+        self.sku_box = QTextEdit()
+        self.sku_box.setPlaceholderText("提取出的去重 SKU 列表将显示在此处 (支持手动追加子SKU逗号算价)...")
+
+        mid_lay = QHBoxLayout()
+        mid_lay.addWidget(self.log_box, stretch=6)
+        mid_lay.addWidget(self.sku_box, stretch=4)
+        lay.addLayout(mid_lay)
+
+        btn_crawl = QPushButton("⚡ 一键带入【采集中心】并启动爬虫")
+        btn_crawl.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-size: 14px; font-weight: bold; padding: 10px;")
+        btn_crawl.clicked.connect(self.trigger_crawl)
+        lay.addWidget(btn_crawl)
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择源目录", Config.DESKTOP_DIR)
+        if d: self.dir_input.setText(d)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def handle_alert(self, level, title, msg):
+        if level == "info":
+            QMessageBox.information(self, title, msg)
+        else:
+            QMessageBox.critical(self, title, msg)
+        # 解除爬虫的验证码等待锁
+        if hasattr(self, 'worker'):
+            self.worker.pause_event.set()
+
+    def process_advanced_images(self):
+        src = self.dir_input.text()
+        if not os.path.exists(src):
+            QMessageBox.warning(self, "错误", "指定目录不存在！")
+            return
+
+        out_dir = os.path.join(Config.DESKTOP_DIR, f"{datetime.now().strftime('%m%d')}整理汇总")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self.log_box.clear()
+        self.btn_process.setEnabled(False)  # 防御性锁定按钮
+
+        # 获取复选框的状态，传入后台线程
+        fetch_online = self.cb_fetch_online.isChecked()
+
+        # 实例化并启动异步工作线程
+        self.worker = AdvancedImageWorker(src, out_dir, fetch_online)
+        self.worker.log_sig.connect(self.append_log)
+        self.worker.alert_sig.connect(self.handle_alert)
+        self.worker.finished_sig.connect(self.on_processing_finished)
+        self.worker.start()
+
+    def on_processing_finished(self, skus, missing_ai_skus):
+        self.btn_process.setEnabled(True)
+        self.sku_box.setText("\n".join(skus))
+
+    def trigger_crawl(self):
+        text = self.sku_box.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "SKU 列表为空，请先处理图片！")
+            return
+        self.start_crawl_signal.emit([s.strip() for s in text.split('\n') if s.strip()])
+
+
+# ==============================================================================
+# 4. 预览与上架 Tab
+# ==============================================================================
+class PreviewTab(QWidget):
+    send_to_video_signal = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_excel_path = None
+        self.batch_dialog = None
+        self.batch_driver = None
+        self.checked_rows = []
+        self.current_batch_idx = 0
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        self.btn_load = QPushButton("📂 加载报价表");
+        self.btn_load.clicked.connect(self.load_data)
+
+        self.btn_config = QPushButton("⚙️ 价格系数")
+        self.btn_config.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
+        self.btn_config.clicked.connect(self.open_coefficient_dialog)
+
+        self.btn_copy_all = QPushButton("📋 复制[标题+链接]");
+        self.btn_copy_all.clicked.connect(self.copy_summary)
+        self.btn_match = QPushButton("📝 匹配标题");
+        self.btn_match.clicked.connect(self.match_en)
+
+        self.btn_batch_upload = QPushButton("🚀 选中项批量上架")
+        self.btn_batch_upload.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
+        self.btn_batch_upload.clicked.connect(self.start_batch_workflow)
+
+        self.btn_make_video = QPushButton("🎬 选中项制作视频")
+        self.btn_make_video.setStyleSheet("background-color: #FF5722; color: white; font-weight: bold; padding: 5px;")
+        self.btn_make_video.clicked.connect(self.trigger_make_video)
+
+        self.btn_refresh = QPushButton("🔄 刷新预览");
+        self.btn_refresh.clicked.connect(self.refresh_table_view)
+
+        [bar.addWidget(b) for b in
+         [self.btn_load, self.btn_config, self.btn_copy_all, self.btn_match, self.btn_make_video, self.btn_batch_upload,
+          self.btn_refresh]]
+        lay.addLayout(bar)
+
+        self.tab = QTableWidget();
+        self.tab.setColumnCount(11)
+        self.tab.setHorizontalHeaderLabels(
+            ["SKU (勾选)", "POP实际", "POP前台", "半托管价", "英文标题", "重量(g)", "预览", "中文标题", "操作",
+             "分配类目", "详情图数"])
+        self.tab.setIconSize(QSize(70, 70));
+        self.tab.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.tab.setColumnWidth(8, 200)
+        self.tab.setColumnWidth(9, 130)
+        self.tab.setColumnWidth(10, 80)
+        lay.addWidget(self.tab)
+
+    def trigger_make_video(self):
+        selected_skus = []
+        for r in range(self.tab.rowCount()):
+            item = self.tab.item(r, 0)
+            if item and item.checkState() == Qt.Checked:
+                sku_text = item.text().strip()
+                if sku_text:
+                    selected_skus.append(sku_text)
+        if not selected_skus:
+            QMessageBox.warning(self, "提示", "请先在表格中勾选您要制作视频的 SKU！")
+            return
+        self.send_to_video_signal.emit(selected_skus)
+
+    def open_coefficient_dialog(self):
+        dlg = CoefficientDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.recalculate_prices()
+
+    def recalculate_prices(self):
+        if not self.current_excel_path:
+            QMessageBox.information(self, "提示", "系数已保存，但目前未加载Excel表格，无法立刻重算。")
+            return
+
+        try:
+            wb = openpyxl.load_workbook(self.current_excel_path)
+            ws = wb.active
+
+            for r in range(self.tab.rowCount()):
+                item0 = self.tab.item(r, 0)
+                data = item0.data(Qt.UserRole)
+                if not data: continue
+
+                p = data.get('price', 0)
+                w = data.get('weight', 0)
+
+                act_val, pre_val, hp_val = PriceCalculator.calc(p, w)
+
+                self.tab.item(r, 1).setText(f"{act_val:.2f}")
+                self.tab.item(r, 2).setText(f"{pre_val:.2f}")
+                self.tab.item(r, 3).setText(f"{hp_val:.2f}")
+
+                ws.cell(row=r + 2, column=4, value=act_val)
+                ws.cell(row=r + 2, column=5, value=pre_val)
+                ws.cell(row=r + 2, column=6, value=hp_val)
+
+            wb.save(self.current_excel_path)
+            QMessageBox.information(self, "重算完成", "🚀 价格已根据最新系数重算完毕，并已永久覆盖保存至原 Excel 表格！")
+            self.refresh_table_view()
+        except Exception as e:
+            QMessageBox.critical(self, "重算保存失败", f"计算成功，但覆盖写入 Excel 时发生错误:\n{e}")
+
+    def load_data(self):
+        try:
+            p, _ = QFileDialog.getOpenFileName(self, "选择", Config.DESKTOP_DIR, "*.xlsx")
+            if not p: return
+            self.current_excel_path = p
+
+            wb = openpyxl.load_workbook(p, data_only=True);
+            ws = wb.active
+            self.tab.setRowCount(0);
+            self.raw_data = []
+
+            for r_idx, row in enumerate(ws.iter_rows(min_row=2), 0):
+                self.tab.insertRow(r_idx);
+                self.tab.setRowHeight(r_idx, 80)
+                sku = str(row[0].value or "")
+
+                orig_price = float(row[1].value or 0)
+                orig_weight = float(row[2].value or 0)
+
+                try:
+                    act = f"{float(row[3].value or 0):.2f}"
+                except:
+                    act = "0.00"
+                try:
+                    pre = f"{float(row[4].value or 0):.2f}"
+                except:
+                    pre = "0.00"
+                try:
+                    hp = f"{float(row[5].value or 0):.2f}"
+                except:
+                    hp = "0.00"
+
+                cn = str(row[6].value or "") if len(row) > 6 else ""
+                img_url = str(row[7].value or "") if len(row) > 7 else ""
+                weight = str(row[2].value or "0")
+
+                en_title = str(row[8].value or "") if len(row) > 8 else ""
+                detail_img_count = str(row[9].value or "0") if len(row) > 9 else "未知"
+
+                for i, v in enumerate([sku, act, pre, hp, en_title, weight]):
+                    item = QTableWidgetItem(v)
+                    if i == 0:
+                        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                        item.setCheckState(Qt.Unchecked)
+                        item.setData(Qt.UserRole, {'price': orig_price, 'weight': orig_weight})
+                    self.tab.setItem(r_idx, i, item)
+
+                self.tab.setItem(r_idx, 6, QTableWidgetItem("..."));
+                self.tab.setItem(r_idx, 7, QTableWidgetItem(cn))
+                self.tab.item(r_idx, 6).setData(Qt.UserRole, img_url)
+
+                t = ImgLoaderThread(r_idx, img_url);
+                t.finished.connect(self.on_img_done);
+                t.start()
+                if not hasattr(self, 'pool'): self.pool = []
+                self.pool.append(t)
+
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(5, 5, 5, 5)
+                action_layout.setSpacing(5)
+
+                btn_a = QPushButton("方案A")
+                btn_a.setStyleSheet("background-color: #2196F3; color: white; border-radius: 3px; padding: 5px;")
+                btn_a.clicked.connect(lambda ch, r=r_idx: self.auto_fill_page(r))
+
+                btn_b = QPushButton("方案B")
+                btn_b.setStyleSheet("background-color: #FF9800; color: white; border-radius: 3px; padding: 5px;")
+                btn_b.clicked.connect(lambda ch, r=r_idx: self.copy_js_logic(r))
+
+                action_layout.addWidget(btn_a)
+                action_layout.addWidget(btn_b)
+                self.tab.setCellWidget(r_idx, 8, action_widget)
+
+                combo = QComboBox()
+                combo.addItems(list(Config.CATEGORY_URLS.keys()))
+                combo.setStyleSheet("padding: 2px;")
+                self.tab.setCellWidget(r_idx, 9, combo)
+
+                item_count = QTableWidgetItem(f"{detail_img_count} 张")
+                item_count.setTextAlignment(Qt.AlignCenter)
+                item_count.setBackground(QColor("#E1F5FE"))
+                self.tab.setItem(r_idx, 10, item_count)
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"表格数据异常，可能被占用。\n{e}")
+
+    def on_img_done(self, r, data):
+        try:
+            pix = QPixmap();
+            pix.loadFromData(data)
+            it = self.tab.item(r, 6);
+            if it is not None:
+                it.setText("");
+                it.setIcon(QIcon(pix))
+        except:
+            pass
+
+    def copy_summary(self):
+        txt = "\n".join([f"{self.tab.item(r, 7).text()}\t{self.tab.item(r, 6).data(Qt.UserRole)}" for r in
+                         range(self.tab.rowCount())])
+        QApplication.clipboard().setText(txt);
+        QMessageBox.information(self, "完成", "中文标题+链接已汇总")
+
+    def match_en(self):
+        d = QDialog(self);
+        d.setWindowTitle("粘贴标题匹配 (终极智能捕捉版)");
+        d.resize(550, 400);
+        v = QVBoxLayout(d)
+        v.addWidget(QLabel("直接粘贴您的内容即可（无视任何格式干扰，只要包含中文标题即可100%匹配）:"))
+        te = QTextEdit();
+        te.setAcceptRichText(False);
+        v.addWidget(te)
+        btn = QPushButton("开启智能捕捉并刷新");
+        v.addWidget(btn)
+
+        def run_match():
+            raw = te.toPlainText().strip()
+            if not raw: return
+
+            match_count = 0
+            lines = raw.split('\n')
+
+            row_matchers = []
+            for r in range(self.tab.rowCount()):
+                table_cn = self.tab.item(r, 7).text().strip()
+                chars = re.findall(r'[\w\u4e00-\u9fa5]', table_cn)
+                if chars:
+                    pattern = r'^\W*' + r'\W*'.join([re.escape(c) for c in chars]) + r'\W*'
+                    regex = re.compile(pattern, re.IGNORECASE)
+                    row_matchers.append((r, regex))
+
+            for l in lines:
+                l = l.strip()
+                if not l: continue
+
+                for r, regex in row_matchers:
+                    match = regex.match(l)
+                    if match:
+                        en = l[match.end():].strip()
+                        if en:
+                            self.tab.setItem(r, 4, QTableWidgetItem(en))
+                            self.tab.item(r, 4).setBackground(QColor("#C8E6C9"))
+                            match_count += 1
+                        break
+
+            d.accept();
+            self.refresh_table_view()
+
+            if match_count > 0:
+                if self.current_excel_path:
+                    try:
+                        wb = openpyxl.load_workbook(self.current_excel_path)
+                        ws = wb.active
+                        if not ws.cell(row=1, column=9).value:
+                            ws.cell(row=1, column=9, value="英文标题")
+                        for r in range(self.tab.rowCount()):
+                            en_val = self.tab.item(r, 4).text().strip()
+                            if en_val:
+                                ws.cell(row=r + 2, column=9, value=en_val)
+                        wb.save(self.current_excel_path)
+                        QMessageBox.information(self, "匹配成功",
+                                                f"✅ 智能捕捉完成！成功填入并永久保存至原表格 {match_count} 条数据！")
+                    except Exception as e:
+                        QMessageBox.warning(self, "保存表格失败",
+                                            f"✅ 已在界面成功匹配 {match_count} 条，但写入Excel失败。\n报错详情: {e}")
+                else:
+                    QMessageBox.information(self, "匹配成功", f"✅ 智能捕捉完成！成功填入 {match_count} 条数据！")
+            else:
+                QMessageBox.warning(self, "匹配失败", "⚠️ 匹配结果为 0 条！")
+
+        btn.clicked.connect(run_match);
+        d.exec_()
+
+    def refresh_table_view(self):
+        self.tab.viewport().update()
+
+    def _core_fill_logic(self, driver, r):
+        sku, act, pre, hp, en, w = [self.tab.item(r, i).text() for i in range(6)]
+        w_kg = round(float(w) / 1000, 3)
+
+        def smart_fill(by, selector, value):
+            try:
+                els = driver.find_elements(by, selector)
+                for el in els:
+                    if el.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                        time.sleep(0.1)
+
+                        driver.execute_script("""
+                            let el = arguments[0];
+                            let val = arguments[1];
+
+                            el.focus();
+                            let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                            if (setter && setter.set) { setter.set.call(el, val); }
+
+                            if (el._valueTracker) { el._valueTracker.setValue(''); }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+
+                            let reactPropsKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                            if (reactPropsKey && el[reactPropsKey]) {
+                                let props = el[reactPropsKey];
+                                if (typeof props.onChange === 'function') {
+                                    try { props.onChange({ target: el, currentTarget: el }); } catch(e) {}
+                                }
+                                if (typeof props.onBlur === 'function') {
+                                    try { props.onBlur({ target: el, currentTarget: el }); } catch(e) {}
+                                }
+                            }
+
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.blur();
+                        """, el, str(value))
+
+                        try:
+                            el.send_keys(Keys.ARROW_RIGHT)
+                        except:
+                            pass
+
+                        time.sleep(0.05)
+            except:
+                pass
+
+        smart_fill(By.CSS_SELECTOR, 'input[name="p-3"], input[label="型号"]', sku)
+        smart_fill(By.CSS_SELECTOR,
+                   'input[id="sku"], input[label="SKU编码"], input[name="skuOuterId"], input[fullfieldname*=".skuOuterId"]',
+                   sku)
+
+        smart_fill(By.XPATH,
+                   "//div[contains(text(), '货品编码')]/ancestor::span[contains(@class, 'ait-input-wrapper')]//input",
+                   sku)
+        smart_fill(By.CSS_SELECTOR, 'input[placeholder="自定义名称"]', sku)
+
+        smart_fill(By.CSS_SELECTOR, 'input[fullfieldname="sku.0.popLogisticWeight"],input[name="popLogisticWeight"]',
+                   w_kg)
+        smart_fill(By.CSS_SELECTOR, 'input[fullfieldname="sku.0.cargoPrice"]', act)
+        smart_fill(By.CSS_SELECTOR, 'input[fullfieldname="sku.0.skuPrice"]', pre)
+        smart_fill(By.CSS_SELECTOR, 'input[fullfieldname="choiceSku.0.declarePrice"]', hp)
+        smart_fill(By.CSS_SELECTOR, 'input[name="title"]', en)
+
+        smart_fill(By.CSS_SELECTOR, 'input[fullfieldname="sku.0.skuStock"]', '10000')
+        smart_fill(By.CSS_SELECTOR, 'input[placeholder="请输入JIT库存数量"]', '1000')
+
+        ctypes.windll.user32.MessageBeep(0)
+        return sku
+
+    def auto_fill_page(self, r):
+        try:
+            en = self.tab.item(r, 4).text()
+            if not en: QMessageBox.warning(self, "！", "标题为空，请先匹配标题！"); return
+
+            opts = webdriver.ChromeOptions();
+            opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+            try:
+                driver = webdriver.Chrome(service=Service(Config.CHROMEDRIVER_PATH), options=opts)
+            except:
+                QMessageBox.critical(self, "填入失败", "无法连接到 Chrome 调试端口 (9222)。")
+                return
+
+            sku = self._core_fill_logic(driver, r)
+            QApplication.clipboard().setText(sku)
+        except Exception as e:
+            QMessageBox.critical(self, "运行错误", str(e))
+
+    def start_batch_workflow(self):
+        self.checked_rows = []
+        for r in range(self.tab.rowCount()):
+            item = self.tab.item(r, 0)
+            if item and item.checkState() == Qt.Checked:
+                self.checked_rows.append(r)
+
+        if not self.checked_rows:
+            QMessageBox.warning(self, "提示", "请先在表格第一列勾选您要批量上架的 SKU！")
+            return
+
+        opts = webdriver.ChromeOptions()
+        opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+        try:
+            self.batch_driver = webdriver.Chrome(service=Service(Config.CHROMEDRIVER_PATH), options=opts)
+        except:
+            QMessageBox.critical(self, "启动失败", "无法连接到 Chrome 调试端口 (9222)。")
+            return
+
+        self.current_batch_idx = 0
+
+        if not self.batch_dialog:
+            self.batch_dialog = QDialog(self)
+            self.batch_dialog.setWindowTitle("流水线控制台")
+            self.batch_dialog.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Tool)
+            self.batch_dialog.setModal(False)
+            self.batch_dialog.resize(360, 230)
+
+            lay = QVBoxLayout(self.batch_dialog)
+            self.lbl_batch_info = QLabel("准备就绪...")
+            self.lbl_batch_info.setStyleSheet("font-size: 14px; line-height: 1.6; color: #333;")
+            self.lbl_batch_info.setWordWrap(True)
+            lay.addWidget(self.lbl_batch_info)
+
+            btn_next = QPushButton("⏭️ 图片已传，保存并开启下一个")
+            btn_next.setStyleSheet(
+                "background-color: #E91E63; color: white; padding: 12px; font-weight: bold; font-size: 14px; border-radius: 5px;")
+            btn_next.clicked.connect(self.process_next_batch_item)
+            lay.addWidget(btn_next)
+
+        self.batch_dialog.show()
+        self.run_current_batch_step()
+
+    def run_current_batch_step(self):
+        if self.current_batch_idx >= len(self.checked_rows):
+            self.lbl_batch_info.setText("🎉 恭喜！您勾选的所有 SKU 已全部处理完毕！")
+            return
+
+        r = self.checked_rows[self.current_batch_idx]
+        sku = self.tab.item(r, 0).text()
+        en = self.tab.item(r, 4).text()
+
+        if not en:
+            self.lbl_batch_info.setText(f"⚠️ 警告: SKU [{sku}] 英文标题为空！\n请点击下方按钮跳过。")
+            return
+
+        combo = self.tab.cellWidget(r, 9)
+        cat_name = combo.currentText()
+        url = Config.CATEGORY_URLS.get(cat_name)
+
+        try:
+            self.batch_driver.get(url)
+        except Exception as e:
+            QMessageBox.critical(self, "网页打开失败", f"无法打开模板: {e}")
+            return
+
+        QApplication.clipboard().setText(sku)
+        self.tab.selectRow(r)
+
+        info_text = (
+            f"🔥 总体进度: <b>{self.current_batch_idx + 1} / {len(self.checked_rows)}</b>\n"
+            f"📦 正在处理: <b style='color:blue;'>【{sku}】</b> (已复制)\n"
+            f"📂 页面类目: 【{cat_name}】\n"
+            f"--------------------------\n"
+            f"👉 <b>请执行以下操作：</b>\n"
+            f"1. 展开页面中的【半托管折叠页】\n"
+            f"2. 点击主表格高亮行的 <b style='color:red;'>[方案A/B]</b> 注入数据\n"
+            f"3. 传图并点击浏览器底部的保存\n"
+            f"4. 完工后，点击下方红色按钮"
+        )
+        self.lbl_batch_info.setText(info_text)
+
+    def process_next_batch_item(self):
+        if self.current_batch_idx < len(self.checked_rows):
+            self.current_batch_idx += 1
+            self.run_current_batch_step()
+        else:
+            self.batch_dialog.close()
+
+    def copy_js_logic(self, r):
+        try:
+            sku, act, pre, hp, en, w = [self.tab.item(r, i).text() for i in range(6)]
+            if not en: QMessageBox.warning(self, "！", "标题为空，请先匹配标题！"); return
+            w_kg = round(float(w) / 1000, 3)
+
+            js = f"""
+            (function(){{
+                function hackReactNode(el, val) {{
+                    if(!el) return;
+                    el.focus(); 
+                    let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (setter && setter.set) {{ setter.set.call(el, val); }}
+                    if (el._valueTracker) {{ el._valueTracker.setValue(''); }}
+                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    let reactPropsKey = Object.keys(el).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                    if (reactPropsKey && el[reactPropsKey]) {{
+                        let props = el[reactPropsKey];
+                        if (typeof props.onChange === 'function') {{
+                            try {{ props.onChange({{ target: el, currentTarget: el }}); }} catch(e) {{}}
+                        }}
+                        if (typeof props.onBlur === 'function') {{
+                            try {{ props.onBlur({{ target: el, currentTarget: el }}); }} catch(e) {{}}
+                        }}
+                    }}
+                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    el.blur();
+                }}
+
+                function forceType(selector, value) {{
+                    let els = document.querySelectorAll(selector);
+                    els.forEach(el => hackReactNode(el, String(value)));
+                }}
+
+                forceType('input[name="p-3"], input[label="型号"]', `{sku}`);
+                forceType('input[id="sku"], input[label="SKU编码"], input[name="skuOuterId"], input[fullfieldname*=".skuOuterId"]', `{sku}`);
+                forceType('input[placeholder="自定义名称"]', `{sku}`);
+
+                try {{
+                    let xpath = "//div[contains(text(), '货品编码')]/ancestor::span[contains(@class, 'ait-input-wrapper')]//input";
+                    let xr = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                    for (let i = 0; i < xr.snapshotLength; i++) {{
+                        hackReactNode(xr.snapshotItem(i), `{sku}`);
+                    }}
+                }} catch(e) {{}}
+
+                forceType('input[fullfieldname="sku.0.popLogisticWeight"], input[name="popLogisticWeight"]', `{w_kg}`);
+                forceType('input[fullfieldname="sku.0.cargoPrice"]', `{act}`);
+                forceType('input[fullfieldname="sku.0.skuPrice"]', `{pre}`);
+                forceType('input[fullfieldname="choiceSku.0.declarePrice"]', `{hp}`);
+                forceType('input[name="title"]', `{en}`);
+                forceType('input[fullfieldname="sku.0.skuStock"]', '10000');
+                forceType('input[placeholder="请输入JIT库存数量"]', '1000');
+            }})();
+            """
+            QApplication.clipboard().setText(js)
+            QMessageBox.information(self, "复制成功", "✅ 方案B 代码已复制！\n请去浏览器 Console 粘贴并回车。")
+        except Exception as e:
+            QMessageBox.critical(self, "复制错误", str(e))
+
+
+# ==============================================================================
+# 5. 主框架
+# ==============================================================================
+class AppMain(QMainWindow):
+    def __init__(self):
+        super().__init__();
+        self.setWindowTitle("速卖通上新闭环系统 v116.0 (英文转码渲染+优先级兜底版)");
+        self.resize(1200, 850)
+
+        self.ts = QTabWidget()
+        self.setCentralWidget(self.ts)
+
+        self.tab_sniper = SniperEngineTab()
+        self.ts.addTab(self.tab_sniper, "0. 狙击手订单提取")
+        self.tab_sniper.start_crawl_signal.connect(self.receive_skus_and_crawl)
+
+        self.tab_adv_img = AdvancedImageTab()
+        self.ts.addTab(self.tab_adv_img, "1. 散装图阵处理 (备用)")
+        self.tab_adv_img.start_crawl_signal.connect(self.receive_skus_and_crawl)
+
+        self.tab_c = QWidget()
+        self.ts.addTab(self.tab_c, "2. 采集中心")
+        self.init_craw_ui()
+
+        self.tab_preview = PreviewTab()
+        self.ts.addTab(self.tab_preview, "3. 预览上架")
+
+        self.tab_video = VideoMakerTab()
+        self.ts.addTab(self.tab_video, "4. 视频切片工坊")
+        self.tab_preview.send_to_video_signal.connect(self.receive_skus_for_video)
+
+    def receive_skus_and_crawl(self, skus):
+        self.ts.setCurrentIndex(2)
+        self.te.setText("\n".join(skus))
+        self.do_crawl()
+
+    def receive_skus_for_video(self, skus):
+        self.ts.setCurrentIndex(4)
+        self.tab_video.sku_input.setText("\n".join(skus))
+
+    def init_craw_ui(self):
+        lay = QVBoxLayout(self.tab_c)
+        b1 = QPushButton("📸 传统旧版处理 (保留备用)");
+        b1.clicked.connect(self.do_img_old);
+        lay.addWidget(b1)
+
+        mid_lay = QHBoxLayout()
+        self.te = QTextEdit();
+        self.te.setPlaceholderText("提取的SKU将显示在这里...\n(支持追加子SKU，如: A3, A3-1, A3-2)")
+
+        self.pic_table = QTableWidget()
+        self.pic_table.setColumnCount(2)
+        self.pic_table.setHorizontalHeaderLabels(["图片预览", "识别到的SKU"])
+        self.pic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.pic_table.verticalHeader().setDefaultSectionSize(80)
+        self.pic_table.setIconSize(QSize(70, 70))
+        self.pic_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        mid_lay.addWidget(self.te, stretch=1)
+        mid_lay.addWidget(self.pic_table, stretch=1)
+        lay.addLayout(mid_lay)
+
+        self.pb = QProgressBar();
+        self.st = QLabel("就绪");
+        [lay.addWidget(w) for w in [self.st, self.pb]]
+        b2 = QPushButton("🚀 极速爬取 (生成表格)");
+        b2.clicked.connect(self.do_crawl);
+        lay.addWidget(b2)
+
+    def do_img_old(self):
+        try:
+            src = Config.IMG_SOURCE_DIR
+            out = os.path.join(Config.DESKTOP_DIR, f"{datetime.now().strftime('%m%d')}汇总")
+            if not os.path.exists(src):
+                self.te.setText("⚠️ 源文件夹不存在！")
+                return
+
+            folder_map = {}
+            for d in os.listdir(src):
+                dp = os.path.join(src, d)
+                if os.path.isdir(dp):
+                    clean_sku = re.sub(r'[\u4e00-\u9fa5]', '', d).strip()
+                    if clean_sku:
+                        if clean_sku not in folder_map:
+                            folder_map[clean_sku] = []
+                        folder_map[clean_sku].append(dp)
+
+            for clean_sku, paths in folder_map.items():
+                target_dir = os.path.join(src, clean_sku)
+                if not os.path.exists(target_dir):
+                    os.makedirs(target_dir, exist_ok=True)
+                for p in paths:
+                    for root_dir, _, files in os.walk(p):
+                        for f in files:
+                            fp = os.path.join(root_dir, f)
+                            dest_fp = os.path.join(target_dir, f)
+                            if os.path.abspath(fp).lower() == os.path.abspath(dest_fp).lower(): continue
+                            if os.path.exists(dest_fp):
+                                name, ext = os.path.splitext(f)
+                                dest_fp = os.path.join(target_dir, f"{name}_{uuid.uuid4().hex[:4]}{ext}")
+                            try:
+                                shutil.move(fp, dest_fp)
+                            except:
+                                pass
+                    if os.path.abspath(p).lower() != os.path.abspath(target_dir).lower():
+                        try:
+                            shutil.rmtree(p)
+                        except:
+                            pass
+                    else:
+                        for sub_d in os.listdir(target_dir):
+                            sub_dp = os.path.join(target_dir, sub_d)
+                            if os.path.isdir(sub_dp):
+                                try:
+                                    shutil.rmtree(sub_dp)
+                                except:
+                                    pass
+
+            os.makedirs(out, exist_ok=True);
+            skus = []
+            preview_data = []
+            valid_img_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif'}
+
+            for d in os.listdir(src):
+                dp = os.path.join(src, d)
+                if os.path.isdir(dp):
+                    skus.append(d)
+                    files = [f for f in os.listdir(dp) if os.path.isfile(os.path.join(dp, f))]
+                    fs = sorted(files, key=lambda x: os.path.getsize(os.path.join(dp, x)))
+
+                    first_img_path = None
+                    for i, f in enumerate(fs, 1):
+                        try:
+                            ext = os.path.splitext(f)[1].lower()
+                            dest_path = os.path.join(out, f"{d}({i}){ext}")
+                            shutil.copy2(os.path.join(dp, f), dest_path)
+                            if not first_img_path and ext in valid_img_exts:
+                                first_img_path = dest_path
+                        except:
+                            pass
+                    preview_data.append((d, first_img_path))
+
+            self.te.setText("\n".join(skus))
+            self.pic_table.setRowCount(len(preview_data))
+            for row, (sku_text, img_path) in enumerate(preview_data):
+                img_item = QTableWidgetItem()
+                if img_path and os.path.exists(img_path):
+                    pix = QPixmap(img_path)
+                    img_item.setIcon(QIcon(pix))
+                self.pic_table.setItem(row, 0, img_item)
+                txt_item = QTableWidgetItem(sku_text)
+                txt_item.setTextAlignment(Qt.AlignCenter)
+                self.pic_table.setItem(row, 1, txt_item)
+            self.st.setText("✅ 清理完毕！")
+
+        except Exception as e:
+            self.te.setText(f"【被拦截】\n\n{e}\n\n{traceback.format_exc()}")
+
+    def handle_worker_alert(self, level, title, msg):
+        if level == "info":
+            QMessageBox.information(self, title, msg)
+        else:
+            QMessageBox.critical(self, title, msg)
+        if hasattr(self, 'w'): self.w.pause_event.set()
+
+    def do_crawl(self):
+        if hasattr(self, 'w') and self.w.isRunning():
+            QMessageBox.warning(self, "防御拦截", "后台已有爬虫正在运行！")
+            return
+
+        self.w = ScrapeWorker(self.te.toPlainText().split('\n'))
+        self.w.progress_signal.connect(
+            lambda c, t, m: [self.pb.setValue(int(c / t * 100) if t > 0 else 0), self.st.setText(m)])
+        self.w.finished_signal.connect(
+            lambda m, p: [QMessageBox.information(self, "完成", m), self.ts.setCurrentIndex(3)])
+        self.w.alert_signal.connect(self.handle_worker_alert)
+        self.w.start()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv);
+    win = AppMain();
+    win.show();
+    sys.exit(app.exec_())

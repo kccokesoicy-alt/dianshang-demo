@@ -1,0 +1,2343 @@
+import os
+import time
+import logging
+import requests
+import numpy as np
+import cv2
+import pandas as pd
+import math
+import shutil
+import re
+import difflib
+import threading
+import unicodedata
+import sys
+import ctypes
+import json
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+from bs4 import BeautifulSoup
+from functools import wraps
+
+import openpyxl  # 强制导入，防止 PyInstaller 漏打包这个 Excel 处理引擎
+import xlrd  # 强制导入，兼容老版本 .xls 文件
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# ======== 【防打包丢失组件】 ========
+import selenium.webdriver.chrome.options
+import selenium.webdriver.chrome.service
+import selenium.webdriver.chrome.webdriver  # <--- 新增这最后一行！
+# ==================================
+
+import urllib3
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
+
+# PyQt5 前端库引入
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
+                             QCheckBox, QGroupBox, QTextEdit, QTabWidget,
+                             QListWidget, QComboBox, QGridLayout, QLineEdit,
+                             QScrollArea, QMessageBox, QSplitter, QSpinBox,
+                             QTableWidget, QTableWidgetItem, QHeaderView, QDialog, QListWidgetItem)
+from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt, QSize
+from PyQt5.QtGui import QPixmap, QColor, QIcon
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ==============================================================================
+# 1. 配置管理层 (动态路径自动适应任何电脑)
+# ==============================================================================
+class Config:
+    USER_DESKTOP = os.path.join(os.path.expanduser("~"), "D:\Desktop")
+    BASE_DIR = os.path.join(USER_DESKTOP, "CHUYA上新自动化工作区")
+
+    DEFAULT_ROOT = os.path.join(BASE_DIR, "1_新品源文件")
+    RESULT_DIR = os.path.join(BASE_DIR, "2_当日导入结果")
+
+    CHROMEDRIVER_PATH = os.path.join(BASE_DIR, "系统必备组件", "chromedriver.exe")
+
+    RINHOO_USER = os.getenv("RINHOO_USER", "songjiajia")
+    RINHOO_PASS = os.getenv("RINHOO_PASS", "songjiajia123")
+    ERP_USER = os.getenv("ERP_USER", "hyz")
+    ERP_PASS = os.getenv("ERP_PASS", "hyz123")
+
+    URLS = {
+        "rinhoo_login": "https://admin.rinhoo1688.com/index.php?c=xdoor&a=login",
+        "rinhoo_search": "https://admin.rinhoo1688.com/index.php?c=cbdepot&a=img_sku_list&sku_id=0&sku_sch_btn=",
+        "erp_login": "http://47.111.187.138",
+        "erp_list": "http://47.111.187.138/index.php/goods/list"
+    }
+
+    MAX_IMAGES = 9
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+
+def init_system_folders():
+    os.makedirs(Config.DEFAULT_ROOT, exist_ok=True)
+    os.makedirs(Config.RESULT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(Config.CHROMEDRIVER_PATH), exist_ok=True)
+
+
+init_system_folders()
+
+
+# ==============================================================================
+# 1.5 动态模板映射引擎
+# ==============================================================================
+class TemplateManager:
+    CONFIG_FILE = os.path.join(Config.BASE_DIR, "template_mapping_v3.json")
+
+    INTERNAL_FIELDS = {
+        "cat_id": ("分类ID", False),
+        "cat_attr": ("产品属性", False),
+        "parent_sku": ("父 SKU (Parent SKU)", False),
+        "title": ("产品标题", True),
+        "desc": ("产品描述", True),
+        "sku": ("子 SKU (Variant SKU)", True),
+        "var_name": ("变种名称", False),
+        "var_attr_1": ("变种属性名称一", False),
+        "var_val_1": ("变种属性值一", False),
+        "price": ("价格 (Price)", True),
+        "stock": ("库存", True),
+        "weight": ("重量 (kg)", True),
+        "main_img": ("主图 URL", True),
+        "img_1": ("附图1", False), "img_2": ("附图2", False),
+        "img_3": ("附图3", False), "img_4": ("附图4", False),
+        "img_5": ("附图5", False), "img_6": ("附图6", False),
+        "img_7": ("附图7", False), "img_8": ("附图8", False),
+        "var_img": ("变种图 / 规格缩略图", False),
+        "delivery_days": ("发货期 (天)", False),
+        "brand": ("品牌", False)
+    }
+
+    FUZZY_DICT = {
+        "cat_id": ["分类id", "类目", "category"],
+        "cat_attr": ["属性", "attribute"],
+        "parent_sku": ["父sku", "主sku", "parent"],
+        "title": ["标题", "title", "名称", "name", "品名", "商品名称"],
+        "desc": ["描述", "详情", "description", "detail"],
+        "sku": ["sku", "编码", "货号", "单品", "商品sku"],
+        "var_name": ["变种", "规格", "variant", "option"],
+        "var_attr_1": ["属性名", "变种名称一"],
+        "var_val_1": ["属性值", "变种属性值一"],
+        "price": ["价格", "售价", "price", "金额", "usd", "myr"],
+        "stock": ["库存", "数量", "stock", "quantity"],
+        "weight": ["重量", "weight", "kg", "g", "包裹"],
+        "main_img": ["主图", "首图", "main", "image", "图片", "主图地址"],
+        "img_1": ["附图1", "图片2"], "img_2": ["附图2", "图片3"],
+        "var_img": ["变种图", "规格图", "尺码图"],
+        "delivery_days": ["发货", "备货", "天数", "days"],
+        "brand": ["品牌", "brand"]
+    }
+
+    BUILTIN_TEMPLATES = {
+        "店小秘标准模板 (默认)": {
+            "cat_id": "分类ID", "cat_attr": "产品属性", "parent_sku": "Parent SKU",
+            "title": "*全球产品产品标题\n（必填）", "desc": "*全球产品\n产品描述\n（必填）",
+            "sku": " SKU\n（单品勿填）", "var_name": "变种名称",
+            "var_attr_1": "变种属性名称一", "var_val_1": "变种属性值一",
+            "price": "*全球产品\n价格(账号币种)\n（必填）", "stock": "*全球产品\n库存\n（必填）",
+            "weight": "*重量(kg)\n(必填）", "main_img": "*主图（URL）地址\n（必填）",
+            "img_1": "附图1", "img_2": "附图2", "img_3": "附图3", "img_4": "附图4",
+            "img_5": "附图5", "img_6": "附图6", "img_7": "附图7", "img_8": "附图8",
+            "var_img": "变种图", "delivery_days": "发货期\n(天)", "brand": "品牌"
+        }
+    }
+
+    @classmethod
+    def get_current_mapping(cls):
+        if os.path.exists(cls.CONFIG_FILE):
+            try:
+                with open(cls.CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
+        return cls.BUILTIN_TEMPLATES["店小秘标准模板 (默认)"]
+
+    @classmethod
+    def save_mapping(cls, mapping):
+        # 【防呆防御】在保存前一秒，确保文件夹存在
+        os.makedirs(os.path.dirname(cls.CONFIG_FILE), exist_ok=True)
+        with open(cls.CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=4)
+
+
+# ==============================================================================
+# 2. 翻译辅助层
+# ==============================================================================
+class TranslationHelper:
+    CN_EN_MAP = {
+        "材质": "Material", "颜色": "Color", "重量": "Weight", "尺寸": "Size",
+        "包装": "Packaging", "风格": "Style", "处理工艺": "Process", "造型": "Shape",
+        "售卖方式": "Selling Method", "款式": "Style", "直径": "Diameter",
+        "链长": "Chain Length", "吊坠": "Pendant", "约": "Approx ",
+        "合金": "Alloy", "铜": "Copper", "铁链": "Iron Chain", "铜链": "Copper Chain",
+        "不锈钢": "Stainless Steel", "钛钢": "Titanium Steel",
+        "银": "Silver", "金": "Gold", "玫瑰金": "Rose Gold", "白K": "White K Color", "古银": "Antique Silver",
+        "珍珠": "Pearl", "仿珍珠": "Imitation Pearl",
+        "水钻": "Rhinestone", "锆石": "Zircon", "水晶": "Crystal", "玻璃": "Glass",
+        "树脂": "Resin", "亚克力": "Acrylic",
+        "CCB": "CCB", "米珠": "Rice Beads", "软陶": "Polymer Clay",
+        "爆花晶": "Crackle Crystal", "贝壳": "Shell", "松石": "Turquoise", "碎石": "Gravel",
+        "丝绒": "Velvet", "绒绳": "Velvet Cord", "蜡绳": "Wax Cord", "皮绳": "Leather Cord", "弹力绳": "Elastic Cord",
+        "金色": "Gold", "银色": "Silver", "黑色": "Black", "白色": "White",
+        "红色": "Red", "蓝色": "Blue", "绿色": "Green", "粉色": "Pink",
+        "紫色": "Purple", "黄色": "Yellow", "橙色": "Orange", "褐色": "Brown",
+        "灰色": "Grey", "双色": "Two-tone", "混色": "Mixed Color", "果绿色": "Lime Green",
+        "海蓝色": "Sea Blue", "钢色": "Steel Color", "白钻": "White Rhinestone",
+        "蓝钻": "Blue Rhinestone", "红钻": "Red Rhinestone",
+        "蝴蝶结": "Bowknot", "爱心": "Heart", "流苏": "Tassel",
+        "醒狮": "Lion Dance", "貔貅": "Pi Xiu", "平安扣": "Safety Buckle",
+        "白菜": "Cabbage (Wealth)", "百财": "Wealth", "吉祥象": "Lucky Elephant", "莲花": "Lotus",
+        "太阳": "Sun", "月亮": "Moon", "星星": "Star",
+        "1条起卖": "1 Piece", "1条": "1 Piece", "1pc": "1 Piece", "1PC": "1 Piece",
+        "1对起卖": "1 Pair", "1对": "1 Pair",
+        "1套起卖": "1 Set", "1套": "1 Set", "1套起码": "1 Set",
+        "件套": "-Piece Set", "2件套": "2-Piece Set", "3件套": "3-Piece Set",
+        "1套2条": "1 Set (2 Pieces)", "1套3条": "1 Set (3 Pieces)",
+        "1套4条": "1 Set (4 Pieces)", "1套5对": "1 Set (5 Pairs)",
+        "1套6件": "1 Set (6 Pieces)", "1套10件": "1 Set (10 Pieces)",
+        "1套8件": "1 Set (8 Pieces)", "1套5件": "1 Set (5 Pieces)",
+        "：": ": ", "，": ", ", "。": ". ", "、": ", ", "+": " + ",
+        "可调节": "Adjustable", "可调": "Adjustable",
+        "和": " and ", "带": " with "
+    }
+
+    @staticmethod
+    def translate_jewelry_text(text):
+        if not text or str(text).lower() == 'nan':
+            return ""
+        result = str(text)
+        for cn, en in TranslationHelper.CN_EN_MAP.items():
+            result = result.replace(cn, en)
+        result = re.sub(r'\s+', ' ', result)
+        result = result.replace(" ,", ",").replace(" :", ":").replace(", ,", ",")
+        return result.strip()
+
+
+# ==============================================================================
+# 3. 工具层
+# ==============================================================================
+class Utils:
+    @staticmethod
+    def setup_logger(name, filename):
+        log_path = Path(Config.RESULT_DIR) / "logs" / filename
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            fh = logging.FileHandler(log_path, encoding='utf-8')
+            ch = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(message)s')
+            fh.setFormatter(formatter)
+            ch.setFormatter(formatter)
+            logger.addHandler(fh)
+            logger.addHandler(ch)
+        return logger
+
+    @staticmethod
+    def _get_chrome_options():
+        opts = webdriver.ChromeOptions()
+        opts.add_argument('--start-maximized')
+        opts.add_experimental_option("excludeSwitches", ["enable-automation", 'enable-logging'])
+        prefs = {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+            "safebrowsing.enabled": False,
+            "profile.default_content_setting_values.notifications": 2
+        }
+        opts.add_experimental_option("prefs", prefs)
+        opts.add_argument("--disable-features=PasswordLeakDetection,SafeBrowsingEnhancedProtection")
+        opts.add_argument("--disable-save-password-bubble")
+        opts.add_argument("--no-default-browser-check")
+        return opts
+
+    @staticmethod
+    def _update_local_driver():
+        print("🔧 正在自动检测并更新 ChromeDriver...")
+        try:
+            downloaded_path = ChromeDriverManager().install()
+            target_path = Config.CHROMEDRIVER_PATH
+            target_dir = os.path.dirname(target_path)
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+            shutil.copy2(downloaded_path, target_path)
+            print("✅ 驱动更新成功！")
+            return True
+        except Exception as e:
+            print(f"❌ 驱动自动更新失败: {e}")
+            return False
+
+    @staticmethod
+    def create_driver():
+        opts = Utils._get_chrome_options()
+        try:
+            driver = webdriver.Chrome(options=opts)
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                   {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"})
+            return driver
+        except Exception as e1:
+            print(f"⚠️ 原生驱动引擎启动失败，尝试接管备用引擎... (内部报错: {e1})")
+            try:
+                path = ChromeDriverManager().install()
+                svc = Service(path)
+                driver = webdriver.Chrome(service=svc, options=opts)
+                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                       {
+                                           "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"})
+                return driver
+            except Exception as e2:
+                print(f"❌ 浏览器彻底崩溃！请确保您的电脑已安装最新版 Google Chrome 浏览器。\n错误详情: {e2}")
+                return None
+
+    @staticmethod
+    def retry(times=3, delay=2):
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                for i in range(times):
+                    try:
+                        return func(*args, **kwargs)
+                    except Exception as e:
+                        if i == times - 1: raise e
+                        time.sleep(delay)
+                return None
+
+            return wrapper
+
+        return decorator
+
+    @staticmethod
+    def atomic_save(df_or_wb, path):
+        # 【防呆防御】强制在保存的最后一刻检查并创建目标文件夹！
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        path_str = str(path)
+        temp_path = path_str + ".temp.xlsx"
+        try:
+            if isinstance(df_or_wb, pd.DataFrame):
+                df_or_wb.to_excel(temp_path, index=False, engine='openpyxl')
+            else:
+                df_or_wb.save(temp_path)
+            if os.path.exists(path_str): os.remove(path_str)
+            shutil.move(temp_path, path_str)
+        except Exception as e:
+            print(f"❌ 文件保存失败: {e}")
+
+    @staticmethod
+    def robust_sku_clean(sku):
+        if pd.isna(sku): return ""
+        sku = str(sku).strip()
+        sku = unicodedata.normalize('NFC', sku)
+        sku = re.sub(r'[\u2000-\u200f\u2028-\u202f\u205f\u3000\ufeff]', '', sku)
+        return sku.strip()
+
+
+# ==============================================================================
+# 4. 核心业务逻辑层
+# ==============================================================================
+class CategoryManager:
+    KEYWORD_MAP = [
+        ("项", "100029",
+         r'[{"attribute_id":"100194","original_attribute_name":"Necklace/Bracelet Style","attribute_value_list":[{"value_id":"1634","original_value_name":"Bead"},{"value_id":"1648","original_value_name":"Chain & Link"},{"value_id":"1679","original_value_name":"Choker"}]},{"attribute_id":"100134","original_attribute_name":"Material","attribute_value_list":[{"value_id":"0","original_value_name":"合金"}]},{"attribute_id":"100022","original_attribute_name":"Gender","attribute_value_list":[{"value_id":"652","original_value_name":"Female"}]}]'),
+        ("手", "100026",
+         r'[{"attribute_id":"100134","original_attribute_name":"Material","attribute_value_list":[{"value_id":"0","original_value_name":"合金"}]},{"attribute_id":"100022","original_attribute_name":"Gender","attribute_value_list":[{"value_id":"652","original_value_name":"Female"}]},{"attribute_id":"100194","original_attribute_name":"Necklace/Bracelet Style","attribute_value_list":[{"value_id":"1662","original_value_name":"Charmed"},{"value_id":"1648","original_value_name":"Chain & Link"},{"value_id":"1634","original_value_name":"Bead"}]}]'),
+        ("耳", "100022",
+         r'[{"attribute_id":"100188","original_attribute_name":"Earring Style","attribute_value_list":[{"value_id":"1686","original_value_name":"Stud Earrings"}]},{"attribute_id":"100134","original_attribute_name":"Material","attribute_value_list":[{"value_id":"0","original_value_name":"合金"}]},{"attribute_id":"100022","original_attribute_name":"Gender","attribute_value_list":[{"value_id":"652","original_value_name":"Female"}]}]'),
+        ("腰", "100032",
+         r'[{"attribute_id":100134,"original_attribute_name":"Material","attribute_value_list":[{"value_unit":"","value_id":0,"original_value_name":"Alloy"}]},{"attribute_id":100022,"original_attribute_name":"Gender","attribute_value_list":[{"value_unit":null,"value_id":652,"original_value_name":"Female"}]}]'),
+        ("胸", "100160",
+         r'[{"attribute_id":101068,"original_attribute_name":"Manufacturer/trader address","attribute_value_list":[{"value_unit":null,"value_id":6701,"original_value_name":"Updating"}]},{"attribute_id":100134,"original_attribute_name":"Material","attribute_value_list":[{"value_unit":"","value_id":0,"original_value_name":"Alloy+Rhinestone"}]},{"attribute_id":100037,"original_attribute_name":"Region of Origin","attribute_value_list":[{"value_unit":null,"value_id":35,"original_value_name":"Mainland China"}]},{"attribute_id":100022,"original_attribute_name":"Gender","attribute_value_list":[{"value_unit":null,"value_id":652,"original_value_name":"Female"}]},{"attribute_id":100999,"original_attribute_name":"Quantity","attribute_value_list":[{"value_unit":"","value_id":0,"original_value_name":"1 PCS"}]},{"attribute_id":100131,"original_attribute_name":"Goods Type","attribute_value_list":[{"value_unit":null,"value_id":1123,"original_value_name":"Designed Goods"}]},{"attribute_id":101067,"original_attribute_name":"Manufacturer/trader name","attribute_value_list":[{"value_unit":null,"value_id":6700,"original_value_name":"Updating"}]}]'),
+        ("戒", "100021",
+         r'[{"attribute_id":"100185","original_attribute_name":"Accessories Set","attribute_value_list":[{"value_id":"1576","original_value_name":"No"}]},{"attribute_id":"100134","original_attribute_name":"Material","attribute_value_list":[{"value_id":"0","original_value_name":"合金"}]},{"attribute_id":"100022","original_attribute_name":"Gender","attribute_value_list":[{"value_id":"652","original_value_name":"Female"}]}]'),
+        ("脚", "100027",
+         r'[{"attribute_id":"100134","original_attribute_name":"Material","attribute_value_list":[{"value_id":"0","original_value_name":"不锈钢"},{"value_id":"0","original_value_name":"合金"}]},{"attribute_id":"100022","original_attribute_name":"Gender","attribute_value_list":[{"value_id":"652","original_value_name":"Female"}]}]')
+    ]
+    GLOBAL_DESC = """CY Boutique
+💐Where Timeless Elegance Meets Affordable Luxury
+
+🎇With two decades of craftsmanship woven into every piece, we've perfected the art of creating accessories that speak to the modern woman. Specializing in curating feminine elegance since 2003, our designs empower women to express their individuality through jewelry that transitions effortlessly from daytime chic to evening glamour.
+💐Why Choose Us?
+🎇Factory-Direct Savings: As a vertically integrated manufacturer, we deliver premium quality at unbeatable prices by eliminating middleman markups.
+20-Year Expertise: Our legacy of jewelry craftsmanship ensures meticulous attention to detail in every chain, clasp, and crystal.
+Woman-Centric Designs: Collections crafted for diverse styles - from minimalist everyday wear to statement pieces that command attention.
+Color: as shown
+Packaging: OPP
+
+🌹If you have any dissatisfaction, please contact us immediately before giving a negative review or initiating a dispute.
+🌹Please give us a chance to solve the problem. We will definitely do our best to resolve it.
+🌹Wish you a pleasant shopping experience!"""
+
+    @staticmethod
+    def get_info(product_name):
+        if not product_name: return "", ""
+        for key, cat_id, attr_json in CategoryManager.KEYWORD_MAP:
+            if key in product_name: return cat_id, attr_json
+        return "", ""
+
+
+class TitleAnalyzer:
+    NOISE_WORDS = {'新款', '爆款', '欧美', '跨境', 'ins', '风', '复古', '简约', '时尚', '项链', '耳环', '手链', '戒指',
+                   'nan'}
+    ATTR_LIB = {
+        'Color': ['Gold', 'Silver', 'Rose Gold', 'Black', 'White', 'Red', 'Blue', 'Green', 'Pink', 'Purple', 'Yellow',
+                  'Orange', 'Grey', 'Brown', 'Beige', 'Multicolor', 'Coffee', 'Champagne', 'Turquoise'],
+        'Material': ['Alloy', 'Stainless Steel', 'Copper', 'Silver Plated', 'Gold Plated', '925 Silver', 'Zircon',
+                     'Pearl', 'Crystal', 'Leather', 'Velvet', 'Acrylic', 'Resin', 'Rhinestone', 'Enamel', 'Ceramic',
+                     'Titanium'],
+        'Style': ['Heart', 'Star', 'Moon', 'Flower', 'Butterfly', 'Cross', 'Geometric', 'Round', 'Square', 'Leaf',
+                  'Animal', 'Letter', 'Dragon', 'Snake', 'Cat', 'Dog'],
+        'Size': ['Adjustable', 'One Size', 'Resizing', 'Open']
+    }
+
+    @staticmethod
+    def parse_erp_full_info(text):
+        if not isinstance(text, str): return "", ""
+        name_match = re.search(r"品名[:：]\s*(.*?)\s*(?:/|$)", text, re.IGNORECASE)
+        clean_name = name_match.group(1).strip() if name_match else ""
+        desc_suffix = ""
+        slash_index = text.find('/')
+        if slash_index != -1:
+            raw_attrs = text[slash_index:]
+            for stop_char in ['【', '[']:
+                stop_idx = raw_attrs.find(stop_char)
+                if stop_idx != -1: raw_attrs = raw_attrs[:stop_idx]
+            parts = [p.strip() for p in raw_attrs.split('/') if p.strip()]
+            desc_suffix = "\n".join(parts)
+        return clean_name, desc_suffix
+
+    @staticmethod
+    def extract_erp_name(text):
+        name, _ = TitleAnalyzer.parse_erp_full_info(text)
+        return name
+
+    @staticmethod
+    def is_same_series(t1, t2):
+        def clean(t):
+            t = re.sub(r'[^\w\s]', '', str(t).lower())
+            for w in TitleAnalyzer.NOISE_WORDS: t = t.replace(w, '')
+            return t.strip()
+
+        c1, c2 = clean(t1), clean(t2)
+        if c1 == c2 and c1 != "": return True
+        return difflib.SequenceMatcher(None, t1, t2).ratio() > 0.85
+
+    @staticmethod
+    def _extract_attributes_from_text(text):
+        found_attrs = []
+        text_lower = text.lower()
+        for category, keywords in TitleAnalyzer.ATTR_LIB.items():
+            for kw in keywords:
+                pattern = r'\b' + re.escape(kw.lower()) + r'\b'
+                if re.search(pattern, text_lower):
+                    found_attrs.append(kw)
+                    break
+        size_match = re.search(r'\b(us\s*)?([4-9]|1[0-5])\b', text_lower)
+        if size_match: found_attrs.append(f"Size {size_match.group(2)}")
+        return found_attrs
+
+    @staticmethod
+    def generate_smart_title_data(titles):
+        titles = sorted(list(set([str(t).strip() for t in titles if str(t).strip() and str(t).lower() != 'nan'])))
+        if not titles: return "Fashion Jewelry Accessories", {}
+        if len(titles) == 1: return titles[0], {titles[0]: "One Style"}
+
+        prefix = os.path.commonprefix(titles)
+        if ' ' in prefix and not prefix.endswith(' '): prefix = prefix[:prefix.rfind(' ') + 1]
+        remainders = [t[len(prefix):] for t in titles]
+        suffix = os.path.commonprefix([r[::-1] for r in remainders])[::-1]
+        if ' ' in suffix and not suffix.startswith(' '): suffix = suffix[suffix.find(' '):]
+
+        diff_map = {}
+        all_keywords = []
+
+        for idx, t in enumerate(titles):
+            if len(t) >= len(prefix) + len(suffix):
+                raw_diff = t[len(prefix):len(t) - len(suffix)].strip()
+            else:
+                raw_diff = t.replace(prefix, "").replace(suffix, "").strip()
+
+            detected_attrs = TitleAnalyzer._extract_attributes_from_text(raw_diff)
+            if detected_attrs:
+                clean_diff = " ".join(detected_attrs)
+            else:
+                clean_diff = re.sub(r'[^\w\s]', '', raw_diff).strip().title()
+                if not clean_diff or (clean_diff.isdigit() and len(clean_diff) < 3):
+                    clean_diff = f"Style {chr(65 + idx)}" if idx < 26 else f"Style {idx + 1}"
+
+            diff_map[t] = clean_diff
+            if "Style " not in clean_diff: all_keywords.append(clean_diff)
+
+        unique_kws = sorted(list(set(all_keywords)), key=all_keywords.index)
+        middle_part = " ".join(unique_kws[:3])
+        final_title = f"{prefix} {middle_part} {suffix}".strip()
+        final_title = re.sub(r'\s+', ' ', final_title)
+
+        longest_orig_title = max(titles, key=len)
+        if len(final_title) < 10 or len(final_title) < len(longest_orig_title) * 0.5:
+            final_title = longest_orig_title
+
+        return final_title, diff_map
+
+
+class VisualEngine:
+    @staticmethod
+    def normalize_url(url):
+        if not url: return ""
+        return url.split("?")[0].replace("_60x60.jpg", ".jpg").replace("_60x60.jpeg", ".jpeg").strip()
+
+    @staticmethod
+    def download_bytes(url, cookies=None):
+        try:
+            headers = {"User-Agent": Config.USER_AGENT, "Referer": "https://admin.rinhoo1688.com/"}
+            resp = requests.get(VisualEngine.normalize_url(url), headers=headers, cookies=cookies, verify=False,
+                                timeout=5)
+            return resp.content if resp.status_code == 200 else None
+        except:
+            return None
+
+    @staticmethod
+    def bytes_to_cv2(b):
+        if not b: return None
+        return cv2.imdecode(np.asarray(bytearray(b), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    @staticmethod
+    def calc_dhash(image, hash_size=8):
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            resized = cv2.resize(gray, (hash_size + 1, hash_size))
+            diff = resized[:, 1:] > resized[:, :-1]
+            return sum([2 ** i for (i, v) in enumerate(diff.flatten()) if v])
+        except:
+            return 0
+
+    @staticmethod
+    def calc_hist_sim(img1, img2):
+        if img1 is None or img2 is None: return 0.0
+        try:
+            h1 = cv2.calcHist([cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)], [0, 1], None, [60, 32], [0, 180, 0, 256])
+            h2 = cv2.calcHist([cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)], [0, 1], None, [60, 32], [0, 180, 0, 256])
+            cv2.normalize(h1, h1, 0, 1, cv2.NORM_MINMAX)
+            cv2.normalize(h2, h2, 0, 1, cv2.NORM_MINMAX)
+            return cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+        except:
+            return 0.0
+
+    @staticmethod
+    def is_duplicate(new_img, seen_fps):
+        nh = VisualEngine.calc_dhash(new_img)
+        for item in seen_fps:
+            if bin(int(nh) ^ int(item['hash'])).count('1') <= 5:
+                if VisualEngine.calc_hist_sim(new_img, item['img']) > 0.9: return True
+        return False
+
+    @staticmethod
+    def classify(cv2_img):
+        if cv2_img is None: return "unknown"
+        try:
+            gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            borders = [gray[0:10, :], gray[h - 10:h, :], gray[:, 0:10], gray[:, w - 10:w]]
+            border_mean = np.mean([np.mean(b) for b in borders])
+            is_white_bg = border_mean > 210
+
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = cv2.countNonZero(edges) / (h * w)
+
+            if is_white_bg:
+                if edge_density > 0.045:
+                    return "size"
+                else:
+                    return "white_bg"
+
+            hsv = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2HSV)
+            skin_mask = cv2.inRange(hsv, np.array([0, 20, 70]), np.array([20, 255, 255]))
+            if cv2.countNonZero(skin_mask) / (h * w) > 0.08:
+                return "model"
+
+            return "placement"
+        except:
+            return "unknown"
+
+
+# ==============================================================================
+# 5. 爬虫层
+# ==============================================================================
+class RinhooCrawler:
+    def __init__(self, sku_meta=None):
+        self.logger = Utils.setup_logger("Rinhoo", "rinhoo_images.log")
+        self.driver = None
+        self.sku_meta = sku_meta if sku_meta else {}
+
+    def login(self):
+        self.logger.info("启动 Rinhoo 浏览器...")
+        self.driver = Utils.create_driver()
+
+        if not self.driver:
+            raise Exception("无法唤起 Chrome 浏览器引擎！请检查系统环境或更新您的浏览器版本。")
+
+        try:
+            self.driver.get(Config.URLS['rinhoo_login'])
+            WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "input")))
+            try:
+                self.driver.find_element(By.XPATH, "//input[contains(@placeholder, '用户名')]").send_keys(
+                    Config.RINHOO_USER)
+                self.driver.find_element(By.XPATH, "//input[contains(@placeholder, '密码')]").send_keys(
+                    Config.RINHOO_PASS)
+                try:
+                    self.driver.find_element(By.XPATH, "//button[contains(text(), '现在登陆')]").click()
+                except:
+                    self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").submit()
+            except:
+                pass
+            WebDriverWait(self.driver, 30).until(lambda d: "c=cbadmin" in d.current_url)
+            self.driver.get(Config.URLS['rinhoo_search'])
+            time.sleep(2)
+        except Exception as e:
+            self.logger.error(f"登录失败: {e}")
+            raise e
+
+    @Utils.retry(times=2)
+    def fetch_sku_images(self, sku):
+        meta = self.sku_meta.get(sku, {'is_leader': False, 'members_count': 1, 'family_members': [sku]})
+        is_leader = meta.get('is_leader', False)
+        if meta.get('members_count', 1) <= 1: is_leader = True
+
+        try:
+            sb = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.ID, "sku_sch_btn")))
+            self.driver.execute_script("arguments[0].value = '';", sb)
+            sb.send_keys(sku)
+            time.sleep(0.5)
+            sb.send_keys(Keys.SPACE)
+            sb.send_keys(Keys.BACKSPACE)
+
+            try:
+                menu_item = WebDriverWait(self.driver, 10).until(
+                    EC.visibility_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item")))
+                menu_item.click()
+            except:
+                sb.send_keys(Keys.ARROW_DOWN)
+                try:
+                    WebDriverWait(self.driver, 2).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item"))).click()
+                except:
+                    return ["SEARCH_FAIL"] * (Config.MAX_IMAGES + 1), ""
+
+            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.ID, "iframe_inner_html")))
+
+            target_sku_lower = str(sku).strip().lower()
+            escaped_sku = re.escape(target_sku_lower)
+            pattern = rf"(?<![\w-]){escaped_sku}(?![\w-])"
+
+            def left_panel_ready(driver):
+                try:
+                    left_html = driver.find_element(By.ID, "left").get_attribute('innerHTML').lower()
+                    return re.search(pattern, left_html) is not None
+                except:
+                    return False
+
+            try:
+                WebDriverWait(self.driver, 4, poll_frequency=0.1).until(left_panel_ready)
+            except:
+                time.sleep(0.8)
+
+            time.sleep(0.5)
+
+            sku_attach_url = None
+            try:
+                xp = f"//*[@id='left']//*[contains(text(), '{sku}')]/ancestor::li[1]//*[contains(text(), '附图')]/preceding::img[1]"
+                sku_attach_url = self.driver.find_element(By.XPATH, xp).get_attribute("src")
+            except:
+                try:
+                    sku_attach_url = self.driver.find_element(By.CSS_SELECTOR,
+                                                              "img.img_sour[is_pmain='0']").get_attribute("src")
+                except:
+                    pass
+            clean_attach_url = VisualEngine.normalize_url(sku_attach_url)
+
+            if not is_leader:
+                final_list = [clean_attach_url] if clean_attach_url else []
+                while len(final_list) < Config.MAX_IMAGES: final_list.append("")
+                final_list.append(clean_attach_url if clean_attach_url else "")
+                return final_list, ""
+
+            iframe_urls = []
+            try:
+                self.driver.switch_to.frame("iframe_inner_html")
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(0.5)
+                iframe_urls = [i.get_attribute("src") for i in
+                               self.driver.find_elements(By.CSS_SELECTOR, "img.img_upload_view")]
+                self.driver.switch_to.default_content()
+            except:
+                self.driver.switch_to.default_content()
+
+            if not iframe_urls:
+                siblings = meta.get('family_members', [])
+                if len(siblings) > 1:
+                    parent_prefix = sku.split('-')[0]
+                    sb = self.driver.find_element(By.ID, "sku_sch_btn")
+                    self.driver.execute_script("arguments[0].value = '';", sb)
+                    sb.send_keys(parent_prefix)
+                    sb.send_keys(Keys.SPACE)
+                    sb.send_keys(Keys.BACKSPACE)
+                    try:
+                        WebDriverWait(self.driver, 5).until(
+                            EC.visibility_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item"))).click()
+                    except:
+                        pass
+                    time.sleep(2)
+
+                    sibling_imgs = []
+                    for member_sku in siblings:
+                        try:
+                            mxp = f"//*[@id='left']//*[contains(text(), '{member_sku}')]/ancestor::li[1]//*[contains(text(), '附图')]/preceding::img[1]"
+                            m_url = self.driver.find_element(By.XPATH, mxp).get_attribute("src")
+                            clean_m = VisualEngine.normalize_url(m_url)
+                            if clean_m and clean_m not in sibling_imgs:
+                                sibling_imgs.append(clean_m)
+                        except:
+                            pass
+
+                    if clean_attach_url:
+                        if clean_attach_url in sibling_imgs: sibling_imgs.remove(clean_attach_url)
+                        sibling_imgs.insert(0, clean_attach_url)
+
+                    final_list = sibling_imgs[:Config.MAX_IMAGES]
+                    while len(final_list) < Config.MAX_IMAGES: final_list.append("")
+                    final_list.append(clean_attach_url if clean_attach_url else "")
+                    return final_list, ""
+
+            sidebar_urls = []
+            try:
+                imgs = self.driver.find_elements(By.XPATH,
+                                                 "//*[@id='left']//*[contains(text(), '附图')]/preceding::img[1]")
+                sidebar_urls = [i.get_attribute("src") for i in imgs if "rinhoo" in i.get_attribute("src")]
+            except:
+                pass
+
+            pool = defaultdict(list)
+            seen_hashes = []
+            cookies = {c['name']: c['value'] for c in self.driver.get_cookies()}
+            base_cv2 = None
+            if clean_attach_url:
+                base_cv2 = VisualEngine.bytes_to_cv2(VisualEngine.download_bytes(clean_attach_url, cookies))
+
+            all_raw = list(set(iframe_urls + sidebar_urls))
+            for url in all_raw:
+                b = VisualEngine.download_bytes(url, cookies)
+                cv2_img = VisualEngine.bytes_to_cv2(b)
+                if cv2_img is None: continue
+                if VisualEngine.is_duplicate(cv2_img, seen_hashes): continue
+
+                dhash = VisualEngine.calc_dhash(cv2_img)
+                seen_hashes.append({'hash': dhash, 'img': cv2_img})
+                cat = VisualEngine.classify(cv2_img)
+                score = VisualEngine.calc_hist_sim(base_cv2, cv2_img)
+                pool[cat].append({'url': VisualEngine.normalize_url(url), 'score': score})
+
+            for k in pool: pool[k].sort(key=lambda x: x['score'], reverse=True)
+
+            final_list = []
+            reserved_size = pool['size'].pop(0)['url'] if pool['size'] else ""
+            reserved_white = pool['white_bg'].pop(0)['url'] if pool['white_bg'] else None
+
+            hero_img = None
+            if pool['model']:
+                hero_img = pool['model'].pop(0)['url']
+            elif pool['placement']:
+                hero_img = pool['placement'].pop(0)['url']
+            elif clean_attach_url:
+                hero_img = clean_attach_url
+            elif pool['unknown']:
+                hero_img = pool['unknown'].pop(0)['url']
+            elif reserved_white:
+                hero_img = reserved_white
+                reserved_white = None
+
+            if hero_img: final_list.append(hero_img)
+
+            middle_candidates = pool['model'] + pool['placement'] + pool['unknown']
+            if clean_attach_url and hero_img != clean_attach_url:
+                middle_candidates.insert(0, {'url': clean_attach_url})
+
+            slots_needed = (1 if reserved_white else 0) + (1 if reserved_size else 0)
+
+            for item in middle_candidates:
+                if len(final_list) < (Config.MAX_IMAGES - slots_needed):
+                    if item['url'] not in final_list: final_list.append(item['url'])
+
+            if reserved_white and reserved_white not in final_list: final_list.append(reserved_white)
+            if reserved_size and reserved_size not in final_list: final_list.append(reserved_size)
+
+            while len(final_list) < Config.MAX_IMAGES: final_list.append("")
+            final_list = final_list[:Config.MAX_IMAGES]
+            final_list.append(clean_attach_url if clean_attach_url else "")
+
+            return final_list, reserved_size
+
+        except Exception as e:
+            self.logger.warning(f"{sku} 抓取异常: {e}")
+            return ["ERROR"] * 10, ""
+
+    def close(self):
+        if self.driver: self.driver.quit()
+
+
+class ErpCrawler:
+    def __init__(self):
+        self.logger = Utils.setup_logger("ERP", "erp_info.log")
+        self.driver = None
+
+    def login(self):
+        self.logger.info("启动 ERP 浏览器...")
+        self.driver = Utils.create_driver()
+
+        if not self.driver:
+            raise Exception("无法唤起 Chrome 浏览器引擎！请检查系统环境或更新您的浏览器版本。")
+
+        try:
+            self.driver.get(Config.URLS['erp_login'])
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")))
+            inputs = self.driver.find_elements(By.TAG_NAME, "input")
+            u_in = [i for i in inputs if i.get_attribute("type") == "text"][0]
+            p_in = [i for i in inputs if i.get_attribute("type") == "password"][0]
+            u_in.clear()
+            u_in.send_keys(Config.ERP_USER)
+            p_in.clear()
+            p_in.send_keys(Config.ERP_PASS)
+            p_in.submit()
+            time.sleep(2)
+            self.driver.get(Config.URLS['erp_list'])
+            WebDriverWait(self.driver, 20).until(EC.presence_of_element_located((By.NAME, "sn")))
+        except Exception as e:
+            self.logger.error(f"ERP登录失败: {e}")
+            raise e
+
+    @Utils.retry(times=2)
+    def fetch_sku_info(self, sku):
+        try:
+            sb = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.NAME, "sn")))
+            sb.clear()
+            sb.send_keys(sku)
+            old_element = sb
+            sb.submit()
+
+            target_sku_lower = str(sku).strip().lower()
+            escaped_sku = re.escape(target_sku_lower)
+            pattern = rf"(?<![\w-]){escaped_sku}(?![\w-])"
+
+            def is_correct_sku_loaded(driver):
+                try:
+                    table_elem = driver.find_element(By.ID, "list")
+                    text = table_elem.text.lower()
+                    if re.search(pattern, text): return True
+                    if "暂无数据" in text or "没有找到" in text or "无记录" in text: return "NOT_FOUND"
+                    return False
+                except:
+                    return False
+
+            try:
+                wait_result = WebDriverWait(self.driver, 4, poll_frequency=0.1).until(is_correct_sku_loaded)
+                if wait_result == "NOT_FOUND":
+                    return {'SKU': sku, 'info1': '', 'desc_suffix': '', 'weight': '0.01', 'price': ''}
+            except:
+                pass
+
+            try:
+                WebDriverWait(self.driver, 10).until(EC.staleness_of(old_element))
+            except:
+                pass
+
+            try:
+                WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.ID, "list")))
+            except:
+                return {'SKU': sku, 'info1': '', 'desc_suffix': '', 'weight': '0.01', 'price': ''}
+
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            clean_name, desc_suffix, weight, price = "", "", "0.01", ""
+
+            data_table = soup.find('table', id='list')
+            if data_table:
+                target_node = data_table.find(string=re.compile(r"品名[:：]"))
+                if target_node:
+                    full_text = target_node.parent.get_text(strip=True)
+                    clean_name, desc_suffix = TitleAnalyzer.parse_erp_full_info(full_text)
+
+                weight_node = data_table.find('font', color="#FB9404", string=re.compile(r"克"))
+                if weight_node:
+                    weight_text = weight_node.get_text(strip=True)
+                    weight = ''.join([c for c in weight_text if c.isdigit() or c == '.'])
+
+                price_nodes = data_table.find_all('font', color="blue")
+                for p_node in price_nodes:
+                    p_text = p_node.get_text(strip=True)
+                    if re.match(r'^\d+(\.\d+)?$', p_text):
+                        price = p_text
+                        break
+
+            return {'SKU': sku, 'info1': clean_name, 'desc_suffix': desc_suffix, 'weight': weight, 'price': price}
+        except Exception as e:
+            return {'SKU': sku, 'info1': '', 'desc_suffix': '', 'weight': '0.01', 'price': ''}
+
+    def close(self):
+        if self.driver: self.driver.quit()
+
+
+# ==============================================================================
+# 6. 数据处理层 (合并逻辑)
+# ==============================================================================
+class DataMerger:
+    @staticmethod
+    def preprocess_files(root_folder):
+        print(f"📂 扫描: {root_folder}")
+        all_dfs = []
+        for root, _, files in os.walk(root_folder):
+            for file in files:
+                path = Path(root) / file
+                if path.suffix.lower() in ['.csv', '.xlsx', '.xls']:
+                    try:
+                        df = pd.read_csv(path) if path.suffix == '.csv' else pd.read_excel(path)
+                        sku_col, title_col = None, None
+                        df.columns = [str(c).strip() for c in df.columns]
+                        for c in df.columns:
+                            c_lower = str(c).lower()
+                            if 'sku' in c_lower or '货号' in c_lower: sku_col = c
+                            if '标题' in c_lower or 'title' in c_lower or '品名' in c_lower: title_col = c
+
+                        if sku_col is None: sku_col = df.columns[0]
+                        if title_col is None: title_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+                        df_clean = df[[sku_col, title_col]].copy()
+                        df_clean.columns = ['SKU', 'Title']
+                        df_clean['SKU'] = df_clean['SKU'].apply(Utils.robust_sku_clean)
+                        df_clean['Title'] = df_clean['Title'].astype(str).str.strip()
+                        df_clean = df_clean[df_clean['SKU'] != 'nan']
+                        df_clean = df_clean[df_clean['SKU'] != '']
+                        df_clean = df_clean[~df_clean['SKU'].str.lower().isin(['sku', '货号'])]
+                        all_dfs.append(df_clean)
+                    except Exception as e:
+                        print(f"⚠️ 读取文件 [{file}] 失败: 可能是格式不对或文件损坏。系统报错: {e}")
+
+        if not all_dfs: return [], None, {}, {}
+
+        merged = pd.concat(all_dfs, ignore_index=True, sort=False)
+        merged['SKU'] = merged['SKU'].apply(Utils.robust_sku_clean)
+        merged.drop_duplicates(subset=['SKU'], inplace=True)
+
+        sku_list = merged['SKU'].tolist()
+        title_list = merged['Title'].tolist()
+
+        family_map = defaultdict(list)
+        processed_indices = set()
+        for i, sku in enumerate(sku_list):
+            if '-' in sku:
+                root = sku.split('-')[0]
+                family_map[root].append(sku)
+                processed_indices.add(i)
+
+        orphans = [i for i in range(len(sku_list)) if i not in processed_indices]
+        grouped_orphans = set()
+        for i in range(len(orphans)):
+            idx1 = orphans[i]
+            if idx1 in grouped_orphans: continue
+            current_fam = [sku_list[idx1]]
+            grouped_orphans.add(idx1)
+            t1 = title_list[idx1]
+            if len(t1) > 5:
+                for j in range(i + 1, len(orphans)):
+                    idx2 = orphans[j]
+                    if idx2 in grouped_orphans: continue
+                    if TitleAnalyzer.is_same_series(t1, title_list[idx2]):
+                        current_fam.append(sku_list[idx2])
+                        grouped_orphans.add(idx2)
+            if len(current_fam) > 1:
+                family_map[current_fam[0]].extend(current_fam)
+
+        sku_meta = {}
+        for fid, members in family_map.items():
+            members = list(dict.fromkeys(members))
+            if not members: continue
+            leader = members[0]
+            for s in members:
+                sku_meta[s] = {'is_leader': (s == leader), 'members_count': len(members), 'family_members': members}
+
+        final_family_map = {}
+        for fid, members in family_map.items():
+            for s in members: final_family_map[s] = fid
+
+        # 【防呆防御】强制在导出底表前建文件夹
+        base_path = Path(Config.RESULT_DIR) / "0_合并后底表.xlsx"
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_excel(base_path, index=False)
+        return sku_list, base_path, final_family_map, sku_meta
+
+    @staticmethod
+    def generate_dianxiaomi_excel(base_path, img_path, erp_path, family_map):
+        print("🔄 生成 ERP 导入表格 (动态加载模板配置)...")
+
+        mapping = TemplateManager.get_current_mapping()
+
+        df_base = pd.read_excel(base_path)
+        df_img = pd.read_excel(img_path)
+        df_erp = pd.read_excel(erp_path)
+
+        custom_title_path = Path(Config.RESULT_DIR) / "4_自定义标题.xlsx"
+        custom_titles = {}
+        if custom_title_path.exists():
+            try:
+                df_custom = pd.read_excel(custom_title_path)
+                for _, row in df_custom.iterrows():
+                    sku = str(row.get('SKU', '')).strip()
+                    title_en = str(row.get('Title_EN', '')).strip()
+                    if sku and sku != 'nan' and title_en:
+                        custom_titles[sku] = title_en
+            except:
+                pass
+
+        for df in [df_base, df_img, df_erp]:
+            target = None
+            for c in df.columns:
+                if 'sku' in str(c).lower() or '货号' in str(c).lower(): target = c; break
+            if not target and len(df.columns) > 0: target = df.columns[0]
+            if target:
+                if target != 'SKU': df.rename(columns={target: 'SKU'}, inplace=True)
+                df['SKU'] = df['SKU'].apply(Utils.robust_sku_clean)
+
+        rename_map = {}
+        for c in df_erp.columns:
+            c_str = str(c)
+            if 'info' in c_str or '商品信息' in c_str: rename_map[c] = '商品信息'
+            if 'weight' in c_str or '重量' in c_str: rename_map[c] = '重量'
+            if 'price' in c_str or '价格' in c_str: rename_map[c] = '价格'
+        df_erp.rename(columns=rename_map, inplace=True)
+        if '价格' in df_erp.columns:
+            df_erp.sort_values(by='价格', na_position='last', inplace=True)
+        df_erp.drop_duplicates(subset=['SKU'], keep='first', inplace=True)
+
+        df_base.drop_duplicates(subset=['SKU'], inplace=True)
+        df_img.drop_duplicates(subset=['SKU'], inplace=True)
+
+        df_full = df_base.merge(df_img, on='SKU', how='left').merge(df_erp, on='SKU', how='left')
+
+        for col in ['商品信息', '重量', '价格', 'desc_suffix', 'Size_Image', '图1']:
+            if col not in df_full.columns: df_full[col] = ""
+            df_full[col] = df_full[col].fillna("").astype(str)
+
+        df_full['Parent_SKU'] = df_full['SKU'].map(family_map).fillna(df_full['SKU'])
+        df_full.reset_index(drop=True, inplace=True)
+
+        img_cols = [f'图{i}' for i in range(1, 10)]
+        for col in img_cols + ['SKU图(第10列)']:
+            if col not in df_full.columns: df_full[col] = ""
+            df_full[col] = df_full[col].fillna("").astype(str).str.strip().replace("nan", "")
+
+        for p_sku, group in df_full.groupby('Parent_SKU'):
+            if len(group) <= 1: continue
+            leader_idx = group.index[0]
+            leader_imgs = [df_full.at[leader_idx, c] for c in img_cols]
+            existing_imgs = set([img for img in leader_imgs if img])
+            candidate_imgs = []
+
+            for idx in group.index:
+                if idx == leader_idx: continue
+                child_img = df_full.at[idx, 'SKU图(第10列)']
+                if child_img and (child_img not in existing_imgs) and (child_img not in candidate_imgs):
+                    candidate_imgs.append(child_img)
+
+            for i in range(1, 10):
+                if not candidate_imgs: break
+                col_name = f'图{i}'
+                if not df_full.at[leader_idx, col_name]:
+                    df_full.at[leader_idx, col_name] = candidate_imgs.pop(0)
+
+        results = []
+        for p_sku, group in df_full.groupby('Parent_SKU'):
+            final_parent_title = ""
+            if p_sku in custom_titles:
+                final_parent_title = custom_titles[p_sku]
+            else:
+                for child_sku in group['SKU']:
+                    if child_sku in custom_titles:
+                        final_parent_title = custom_titles[child_sku]
+                        break
+
+            diff_map = {}
+            if not final_parent_title:
+                raw_titles = group['商品信息'].fillna('').astype(str).tolist()
+                raw_titles = [t for t in raw_titles if t.lower() != 'nan' and t.strip() != '']
+                if not raw_titles: raw_titles = group['Title'].replace('nan', '').dropna().astype(str).tolist()
+                final_parent_title, diff_map = TitleAnalyzer.generate_smart_title_data(raw_titles)
+            else:
+                raw_titles = group['商品信息'].fillna('').astype(str).tolist()
+                raw_titles = [t for t in raw_titles if t.lower() != 'nan' and t.strip() != '']
+                _, diff_map = TitleAnalyzer.generate_smart_title_data(raw_titles)
+
+            used_variants = defaultdict(int)
+
+            for _, row in group.iterrows():
+                raw_info = str(row['商品信息']).strip()
+                var_val = diff_map.get(raw_info, "Style") if raw_info and raw_info != "nan" else "Style"
+                if used_variants[var_val] > 0:
+                    suffix_char = chr(65 + used_variants[var_val])
+                    final_var = f"{var_val} {suffix_char}"
+                else:
+                    final_var = var_val
+                used_variants[var_val] += 1
+
+                cat_id, cat_attr = CategoryManager.get_info(final_parent_title)
+                try:
+                    w_kg = math.ceil(float(re.sub(r'[^\d.]', '', str(row['重量']))) / 10) / 100
+                except:
+                    w_kg = 0.01
+                if w_kg < 0.01: w_kg = 0.01
+
+                raw_imgs = [row.get(f'图{i}', '') for i in range(1, 10)]
+                imgs = []
+                seen_in_row = set()
+                for img in raw_imgs:
+                    if img and img != "nan" and img not in seen_in_row:
+                        imgs.append(img)
+                    seen_in_row.add(img)
+
+                final_desc = CategoryManager.GLOBAL_DESC
+                raw_desc_suffix = row.get('desc_suffix', '').strip()
+                extra_desc = TranslationHelper.translate_jewelry_text(raw_desc_suffix)
+                if extra_desc: final_desc += f"\n\n{extra_desc}"
+
+                img_html = ""
+                size_url = str(row.get('Size_Image', '')).strip()
+                if size_url and size_url.lower() != 'nan' and size_url != "":
+                    img_html += f'<br><img width="800" referrerpolicy="no-referrer" src="{size_url}"><br>\n'
+
+                context_url = imgs[0] if imgs else ""
+                if context_url and context_url != size_url:
+                    img_html += f'<br><img width="800" referrerpolicy="no-referrer" src="{context_url}"><br>\n'
+                final_desc += img_html
+
+                internal_data = {
+                    "cat_id": cat_id,
+                    "cat_attr": cat_attr,
+                    "parent_sku": p_sku,
+                    "title": final_parent_title,
+                    "desc": final_desc,
+                    "sku": row['SKU'],
+                    "var_name": final_var,
+                    "var_attr_1": "style",
+                    "var_val_1": final_var,
+                    "price": row.get('价格', ''),
+                    "stock": "9999",
+                    "weight": w_kg,
+                    "main_img": imgs[0] if imgs else "",
+                    "img_1": imgs[1] if len(imgs) > 1 else "",
+                    "img_2": imgs[2] if len(imgs) > 2 else "",
+                    "img_3": imgs[3] if len(imgs) > 3 else "",
+                    "img_4": imgs[4] if len(imgs) > 4 else "",
+                    "img_5": imgs[5] if len(imgs) > 5 else "",
+                    "img_6": imgs[6] if len(imgs) > 6 else "",
+                    "img_7": imgs[7] if len(imgs) > 7 else "",
+                    "img_8": imgs[8] if len(imgs) > 8 else "",
+                    "var_img": row.get('SKU图(第10列)', ""),
+                    "delivery_days": "2",
+                    "brand": "NoBrande"
+                }
+
+                output_row = {}
+                for key in TemplateManager.INTERNAL_FIELDS.keys():
+                    target_header = mapping.get(key, "").strip()
+                    if target_header:
+                        output_row[target_header] = internal_data.get(key, "")
+
+                results.append(output_row)
+
+        df_res = pd.DataFrame(results)
+
+        ordered_headers = [mapping.get(k, "").strip() for k in TemplateManager.INTERNAL_FIELDS.keys() if
+                           mapping.get(k, "").strip()]
+        final_df = df_res[ordered_headers] if not df_res.empty else pd.DataFrame(columns=ordered_headers)
+
+        # 【防呆防御】强制在导出成品前建文件夹
+        save_path = Path(Config.RESULT_DIR) / f"3_系统导出_{datetime.now().strftime('%H%M')}.xlsx"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        final_df.to_excel(save_path, index=False)
+        print(f"✅ 成功套用动态模板并生成文件: {save_path}")
+
+
+# ==============================================================================
+# 7. 任务执行函数 (加入弹窗拦截与抽检逻辑)
+# ==============================================================================
+
+def run_image_task_with_crawler(crawler, sku_list, sku_meta):
+    img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+    processed_skus = set()
+    all_data = []
+
+    if os.path.exists(img_path):
+        try:
+            df_exist = pd.read_excel(img_path)
+            target = None
+            for c in df_exist.columns:
+                if 'sku' in str(c).lower(): target = c; break
+            if target:
+                df_exist[target] = df_exist[target].apply(Utils.robust_sku_clean)
+                processed_skus = set(df_exist[target].tolist())
+                all_data = df_exist.to_dict('records')
+                print(f"📷 [图片] 检测到历史记录: 已完成 {len(processed_skus)} 个，自动跳过...")
+        except:
+            pass
+
+    tasks = [s for s in sku_list if s not in processed_skus]
+    if not tasks:
+        print("📷 [图片] 所有任务已完成，跳过采集。")
+        return
+
+    try:
+        for i, sku in enumerate(tasks):
+            print(f"\n{'=' * 40}")
+            print(f"📸 [图片抓取] 正在处理: {sku} ({i + 1}/{len(tasks)})")
+
+            imgs, size_img_url = crawler.fetch_sku_images(sku)
+            count = len([x for x in imgs[:9] if x])
+            has_size = "✅ 有" if size_img_url else "❌ 无"
+
+            print(f"   ✨ 状态: 完成 | 🖼️ 图片数: {count} | 📏 尺寸图: {has_size}")
+            print(f"{'=' * 40}\n")
+
+            all_data.append({
+                "SKU": sku,
+                **{f"图{k + 1}": v for k, v in enumerate(imgs[:9])},
+                "SKU图(第10列)": imgs[9] if len(imgs) > 9 else "",
+                "Size_Image": size_img_url
+            })
+
+            if i > 0 and i % 5 == 0: Utils.atomic_save(pd.DataFrame(all_data), img_path)
+
+        Utils.atomic_save(pd.DataFrame(all_data), img_path)
+    except Exception as e:
+        print(f"图片任务崩溃: {e}")
+
+
+def run_erp_task_with_crawler(crawler, sku_list):
+    erp_path = Path(Config.RESULT_DIR) / "2_ERP结果.xlsx"
+    processed_skus = set()
+    all_data = []
+
+    if os.path.exists(erp_path):
+        try:
+            df_exist = pd.read_excel(erp_path)
+            target = None
+            for c in df_exist.columns:
+                if 'sku' in str(c).lower(): target = c; break
+            if target:
+                df_exist[target] = df_exist[target].apply(Utils.robust_sku_clean)
+                processed_skus = set(df_exist[target].tolist())
+                all_data = df_exist.to_dict('records')
+        except:
+            pass
+
+    tasks = [s for s in sku_list if s not in processed_skus]
+    if not tasks: return
+
+    try:
+        print("📊 [ERP] 开始采集...")
+        for i, sku in enumerate(tasks):
+            try:
+                info = crawler.fetch_sku_info(sku)
+                all_data.append(info)
+                if i > 0 and i % 10 == 0: Utils.atomic_save(pd.DataFrame(all_data), erp_path)
+            except Exception as e_inner:
+                print(f"⚠️ 跳过 {sku}: {e_inner}")
+                all_data.append({'SKU': sku, 'info1': '', 'desc_suffix': '', 'weight': '0.01', 'price': ''})
+
+        Utils.atomic_save(pd.DataFrame(all_data), erp_path)
+        print("✅ [ERP] 采集完毕！")
+    except Exception as e_outer:
+        print(f"\n❌❌❌ [ERP] 发生致命错误: {e_outer}")
+
+
+def run_spot_check(sku_list, sku_meta):
+    samples = sku_list[::3]
+    if not samples:
+        return True, "无有效数据可抽检"
+
+    print(f"\n🕵️‍♂️ 启动系统防错自检：总任务 {len(sku_list)} 个，盲抽 {len(samples)} 个样本核对。")
+
+    c_img = RinhooCrawler(sku_meta)
+    c_erp = ErpCrawler()
+
+    login_errors = []
+
+    def img_login_wrapper():
+        try:
+            c_img.login()
+        except Exception as e:
+            login_errors.append(f"图片系统启动失败: {e}")
+
+    def erp_login_wrapper():
+        try:
+            c_erp.login()
+        except Exception as e:
+            login_errors.append(f"ERP系统启动失败: {e}")
+
+    t1_login = threading.Thread(target=img_login_wrapper)
+    t2_login = threading.Thread(target=erp_login_wrapper)
+    t1_login.start();
+    t2_login.start()
+    t1_login.join();
+    t2_login.join()
+
+    if login_errors:
+        c_img.close()
+        c_erp.close()
+        return False, f"❌ 抽检阶段浏览器启动失败: {login_errors}"
+
+    try:
+        print("等待人工确认弹窗...")
+        ctypes.windll.user32.MessageBoxW(0,
+                                         "【抽检阶段】网页已打开。\n\n请手动处理好所有弹窗，确认干净后，点击【确定】开始核对！",
+                                         "等待手动确认", 0x40040)
+
+        img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+        erp_path = Path(Config.RESULT_DIR) / "2_ERP结果.xlsx"
+
+        try:
+            df_img = pd.read_excel(img_path).set_index('SKU') if os.path.exists(img_path) else pd.DataFrame()
+            df_erp = pd.read_excel(erp_path).set_index('SKU') if os.path.exists(erp_path) else pd.DataFrame()
+        except Exception as e:
+            return False, f"❌ 读取本地结果文件失败: {e}"
+
+        for i, sku in enumerate(samples):
+            print(f"严格抽检交叉对比: {sku} ({i + 1}/{len(samples)})")
+
+            try:
+                db_price = float(df_erp.loc[sku, 'price']) if sku in df_erp.index and pd.notna(
+                    df_erp.loc[sku, 'price']) else 0.0
+            except:
+                db_price = 0.0
+
+            try:
+                raw_w = str(df_erp.loc[sku, '重量'] if '重量' in df_erp.columns else df_erp.loc[sku, 'weight']).replace(
+                    'g', '').replace('克', '')
+                db_weight = float(raw_w.strip()) if sku in df_erp.index else 0.0
+            except:
+                db_weight = 0.0
+
+            db_img1 = str(df_img.loc[sku, '图1']) if sku in df_img.index and '图1' in df_img.columns else ""
+
+            erp_info = c_erp.fetch_sku_info(sku)
+            try:
+                new_price = float(erp_info.get('price', 0) if erp_info and erp_info.get('price') else 0)
+            except:
+                new_price = 0.0
+
+            try:
+                new_weight = float(str(erp_info.get('weight', 0)).replace('g', '').replace('克',
+                                                                                           '').strip() if erp_info and erp_info.get(
+                    'weight') else 0)
+            except:
+                new_weight = 0.0
+
+            imgs, _ = c_img.fetch_sku_images(sku)
+            new_img1 = imgs[0] if imgs else ""
+
+            if abs(new_price - db_price) > 0.01 or abs(new_weight - db_weight) > 0.01:
+                return False, f"❌ [严重错位熔断] {sku} - 记录({db_price}/{db_weight}) 与 现场({new_price}/{new_weight}) 不符！"
+
+            if new_img1 and db_img1 and new_img1 != db_img1:
+                return False, f"❌ [严重错位熔断] {sku} - 首图链接错位张冠李戴！"
+
+        return True, f"✅ 完美！抽检 {len(samples)} 个样本数据 100% 正确。"
+    except Exception as e:
+        return False, f"❌ 抽检过程崩溃: {str(e)}"
+    finally:
+        c_img.close()
+        c_erp.close()
+
+
+# ----------------- 线程类 -----------------
+class WorkerThread(QThread):
+    finished_signal = pyqtSignal()
+
+    def __init__(self, input_dir):
+        super().__init__()
+        self.input_dir = input_dir
+
+    def run(self):
+        try:
+            print(f"🚀 启动智能采集 (已启用断点续传)...")
+            # 【防呆防御】在主任务开跑前，强制在桌面上重建文件夹
+            os.makedirs(Config.RESULT_DIR, exist_ok=True)
+
+            sku_list, base_path, family_map, sku_meta = DataMerger.preprocess_files(self.input_dir)
+            if not sku_list:
+                print("❌ 未找到有效数据，请检查文件夹。")
+                self.finished_signal.emit()
+                return
+
+            print("正在自动启动 ERP 和 Rinhoo 浏览器进行登录...")
+            c_img = RinhooCrawler(sku_meta)
+            c_erp = ErpCrawler()
+
+            login_errors = []
+
+            def img_login_wrapper():
+                try:
+                    c_img.login()
+                except Exception as e:
+                    login_errors.append(f"图片系统: {e}")
+
+            def erp_login_wrapper():
+                try:
+                    c_erp.login()
+                except Exception as e:
+                    login_errors.append(f"ERP系统: {e}")
+
+            t1_login = threading.Thread(target=img_login_wrapper)
+            t2_login = threading.Thread(target=erp_login_wrapper)
+            t1_login.start();
+            t2_login.start()
+            t1_login.join();
+            t2_login.join()
+
+            if login_errors:
+                print("\n🚨 浏览器启动失败，任务终止！可能原因：您的电脑未安装最新版 Chrome 浏览器，或系统网络受到限制。")
+                for err in login_errors:
+                    print(f" -> 报错详情: {err}")
+                c_img.close()
+                c_erp.close()
+                self.finished_signal.emit()
+                return
+
+            print("等待人工确认弹窗...")
+            ctypes.windll.user32.MessageBoxW(0,
+                                             "ERP与Rinhoo网页均已打开并登录！\n\n请您在浏览器中手动处理好所有弹窗或验证码。\n处理干净后，请点击【确定】开始全速抓取！",
+                                             "等待人工确认", 0x40040)
+            print("确认完毕，引擎全速启动！")
+
+            t1 = threading.Thread(target=run_image_task_with_crawler, args=(c_img, sku_list, sku_meta))
+            t2 = threading.Thread(target=run_erp_task_with_crawler, args=(c_erp, sku_list))
+            t1.start();
+            t2.start()
+            t1.join();
+            t2.join()
+
+            c_img.close()
+            c_erp.close()
+
+            success, msg = run_spot_check(sku_list, sku_meta)
+            print(msg)
+            if not success:
+                print("🚨 触发防错熔断机制！发现数据错位，终止后续生成操作。")
+                self.finished_signal.emit()
+                return
+
+            DataMerger.generate_dianxiaomi_excel(
+                base_path, Path(Config.RESULT_DIR) / "1_图片结果.xlsx", Path(Config.RESULT_DIR) / "2_ERP结果.xlsx",
+                family_map
+            )
+            print("\n🎉 第一阶段完毕！你可以切换到【批量翻译】或【图片精修预览】页进行微调了。")
+        except Exception as e:
+            print(f"❌ 运行发生严重错误: {e}")
+        finally:
+            self.finished_signal.emit()
+
+
+class MergeOnlyThread(QThread):
+    finished_signal = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        try:
+            print("\n🔄 正在读取最新的图片、翻译与【模板映射】配置，重新生成导入表...")
+            # 【防呆防御】同样在此处强行生成一次
+            os.makedirs(Config.RESULT_DIR, exist_ok=True)
+
+            base_path = Path(Config.RESULT_DIR) / "0_合并后底表.xlsx"
+            img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+            erp_path = Path(Config.RESULT_DIR) / "2_ERP结果.xlsx"
+
+            df_base = pd.read_excel(base_path)
+            family_map = {}
+            for _, row in df_base.iterrows():
+                sku = str(row['SKU']).strip()
+                if '-' in sku:
+                    family_map[sku] = sku.split('-')[0]
+                else:
+                    family_map[sku] = sku
+
+            DataMerger.generate_dianxiaomi_excel(
+                base_path, img_path, erp_path, family_map
+            )
+            print("🎉 最终表格重新生成完毕，请前往【当日导入结果】文件夹查看。")
+        except Exception as e:
+            print(f"❌ 生成失败: {e}")
+        finally:
+            self.finished_signal.emit()
+
+
+class FetchImageThread(QThread):
+    finished_signal = pyqtSignal(bytes)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            if not self.url or str(self.url).lower() == 'nan':
+                self.finished_signal.emit(b"")
+                return
+            resp = requests.get(self.url, timeout=5, verify=False)
+            if resp.status_code == 200:
+                self.finished_signal.emit(resp.content)
+            else:
+                self.finished_signal.emit(b"")
+        except:
+            self.finished_signal.emit(b"")
+
+
+class BatchImageFetcher(QThread):
+    image_fetched = pyqtSignal(int, bytes)
+
+    def __init__(self, fetch_list):
+        super().__init__()
+        self.fetch_list = fetch_list
+
+    def run(self):
+        for row, url in self.fetch_list:
+            if not url or str(url).lower() == 'nan':
+                self.image_fetched.emit(row, b"")
+                continue
+            try:
+                resp = requests.get(url, timeout=5, verify=False)
+                if resp.status_code == 200:
+                    self.image_fetched.emit(row, resp.content)
+                else:
+                    self.image_fetched.emit(row, b"")
+            except:
+                self.image_fetched.emit(row, b"")
+
+
+# ----------------- UI 控件类 -----------------
+class ImageSlotWidget(QWidget):
+    delete_requested = pyqtSignal(str)
+
+    def __init__(self, title, col_name):
+        super().__init__()
+        self.col_name = col_name
+        layout = QVBoxLayout(self)
+
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setStyleSheet("font-weight: bold; color: #333;")
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+
+        self.lbl_img = QLabel("暂无图片")
+        self.lbl_img.setFixedSize(140, 140)
+        self.lbl_img.setAlignment(Qt.AlignCenter)
+        self.lbl_img.setStyleSheet("border: 1px solid #aaa; background-color: #f0f0f0;")
+        self.lbl_img.setScaledContents(True)
+
+        self.txt_url = QLineEdit()
+        self.txt_url.setPlaceholderText("粘贴新URL...")
+
+        btn_layout = QHBoxLayout()
+        self.btn_update = QPushButton("更新")
+        self.btn_clear = QPushButton("清空")
+        self.btn_delete = QPushButton("删除并前移")
+        self.btn_delete.setStyleSheet("color: #d9534f; font-weight: bold;")
+
+        btn_layout.addWidget(self.btn_update)
+        btn_layout.addWidget(self.btn_clear)
+        btn_layout.addWidget(self.btn_delete)
+
+        layout.addWidget(self.lbl_title)
+        layout.addWidget(self.lbl_img, alignment=Qt.AlignCenter)
+        layout.addWidget(self.txt_url)
+        layout.addLayout(btn_layout)
+
+        self.btn_update.clicked.connect(self.update_image)
+        self.btn_clear.clicked.connect(self.clear_image)
+        self.btn_delete.clicked.connect(self.request_delete)
+        self.fetch_thread = None
+
+    def set_data(self, url):
+        url = str(url).strip()
+        if url.lower() == 'nan': url = ""
+        self.txt_url.setText(url)
+        self.load_image(url)
+
+    def update_image(self):
+        url = self.txt_url.text().strip()
+        self.load_image(url)
+
+    def clear_image(self):
+        self.txt_url.clear()
+        self.lbl_img.clear()
+        self.lbl_img.setText("已清空")
+
+    def request_delete(self):
+        self.delete_requested.emit(self.col_name)
+
+    def load_image(self, url):
+        if not url:
+            self.lbl_img.clear()
+            self.lbl_img.setText("暂无图片")
+            return
+        self.lbl_img.setText("加载中...")
+        self.fetch_thread = FetchImageThread(url)
+        self.fetch_thread.finished_signal.connect(self.on_image_loaded)
+        self.fetch_thread.start()
+
+    def on_image_loaded(self, data):
+        if data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            self.lbl_img.setPixmap(pixmap)
+        else:
+            self.lbl_img.clear()
+            self.lbl_img.setText("加载失败")
+
+
+class TitleMatchTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.fetcher = None
+        self.initUI()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+
+        top_bar = QHBoxLayout()
+        self.btn_load = QPushButton("🔄 1. 刷新加载数据")
+        self.btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
+        self.btn_load.clicked.connect(self.load_data)
+
+        self.btn_select_all = QPushButton("☑️ 全选/反选")
+        self.btn_select_all.setStyleSheet("background-color: #78909C; color: white; font-weight: bold; padding: 10px;")
+        self.btn_select_all.clicked.connect(self.toggle_select_all)
+
+        self.btn_copy_selected = QPushButton("📋 复制选中的标题")
+        self.btn_copy_selected.setStyleSheet(
+            "background-color: #FF5722; color: white; font-weight: bold; padding: 10px;")
+        self.btn_copy_selected.clicked.connect(self.copy_selected)
+
+        self.btn_copy_all = QPushButton("📑 一键复制所有标题")
+        self.btn_copy_all.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
+        self.btn_copy_all.clicked.connect(self.copy_all)
+
+        self.btn_match = QPushButton("📝 2. 智能粘贴匹配")
+        self.btn_match.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold; padding: 10px;")
+        self.btn_match.clicked.connect(self.open_match_dialog)
+
+        self.btn_save = QPushButton("💾 3. 保存匹配结果")
+        self.btn_save.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
+        self.btn_save.clicked.connect(self.save_data)
+
+        top_bar.addWidget(self.btn_load)
+        top_bar.addWidget(self.btn_select_all)
+        top_bar.addWidget(self.btn_copy_selected)
+        top_bar.addWidget(self.btn_copy_all)
+        top_bar.addWidget(self.btn_match)
+        top_bar.addWidget(self.btn_save)
+        lay.addLayout(top_bar)
+
+        self.tab = QTableWidget(0, 6)
+        self.tab.setHorizontalHeaderLabels(["勾选", "SKU变种图", "SKU", "原中文标题", "已匹配的外语标题", "状态"])
+        self.tab.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tab.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tab.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tab.verticalHeader().setDefaultSectionSize(80)
+        lay.addWidget(self.tab)
+
+    def load_data(self):
+        base_path = Path(Config.RESULT_DIR) / "0_合并后底表.xlsx"
+        erp_path = Path(Config.RESULT_DIR) / "2_ERP结果.xlsx"
+        img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+        saved_path = Path(Config.RESULT_DIR) / "4_自定义标题.xlsx"
+
+        if not base_path.exists():
+            QMessageBox.warning(self, "错误", "未找到 0_合并后底表.xlsx，请先抓取！")
+            return
+
+        df_base = pd.read_excel(base_path)
+        df_erp = pd.read_excel(erp_path) if erp_path.exists() else pd.DataFrame(columns=['SKU', 'info1'])
+        df_img = pd.read_excel(img_path) if img_path.exists() else pd.DataFrame(columns=['SKU'])
+        df_saved = pd.read_excel(saved_path) if saved_path.exists() else pd.DataFrame(columns=['SKU', 'Title_EN'])
+
+        sku_cn_map = {}
+        for _, row in df_base.iterrows():
+            sku = str(row.get('SKU', '')).strip()
+            title = str(row.get('Title', '')).strip()
+            if sku and sku != 'nan': sku_cn_map[sku] = title
+
+        for _, row in df_erp.iterrows():
+            sku = str(row.get('SKU', '')).strip()
+            info1 = str(row.get('info1', '')).strip()
+            if sku and sku != 'nan' and info1 and info1 != 'nan':
+                sku_cn_map[sku] = info1
+
+        sku_img_map = {}
+        if not df_img.empty:
+            target = None
+            for c in df_img.columns:
+                if 'sku' in str(c).lower(): target = c; break
+            if target:
+                for _, row in df_img.iterrows():
+                    sku = str(row[target]).strip()
+                    var_img = str(row.get('SKU图(第10列)', '')).strip()
+                    if not var_img or var_img.lower() == 'nan':
+                        var_img = str(row.get('图1', '')).strip()
+                    if var_img and var_img.lower() != 'nan':
+                        sku_img_map[sku] = var_img
+
+        sku_en_map = {}
+        for _, row in df_saved.iterrows():
+            sku = str(row.get('SKU', '')).strip()
+            en = str(row.get('Title_EN', '')).strip()
+            if sku and sku != 'nan': sku_en_map[sku] = en
+
+        self.tab.setRowCount(len(sku_cn_map))
+        fetch_list = []
+
+        for i, (sku, cn_title) in enumerate(sku_cn_map.items()):
+            en_title = sku_en_map.get(sku, "")
+
+            chk_item = QTableWidgetItem()
+            chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk_item.setCheckState(Qt.Unchecked)
+            self.tab.setItem(i, 0, chk_item)
+
+            img_lbl = QLabel("加载中...")
+            img_lbl.setAlignment(Qt.AlignCenter)
+            self.tab.setCellWidget(i, 1, img_lbl)
+
+            url = sku_img_map.get(sku, "")
+            if url:
+                fetch_list.append((i, url))
+            else:
+                img_lbl.setText("无图")
+
+            self.tab.setItem(i, 2, QTableWidgetItem(sku))
+            self.tab.setItem(i, 3, QTableWidgetItem(cn_title))
+            self.tab.setItem(i, 4, QTableWidgetItem(en_title))
+            self.tab.setItem(i, 5, QTableWidgetItem("✅ 有翻译" if en_title else "⏳ 待匹配"))
+            if en_title:
+                self.tab.item(i, 4).setBackground(Qt.green)
+
+        if fetch_list:
+            self.fetcher = BatchImageFetcher(fetch_list)
+            self.fetcher.image_fetched.connect(self.on_image_fetched)
+            self.fetcher.start()
+
+        self.main_window.log_box.append("✔️ 标题匹配数据与图片挂载任务已启动！")
+
+    def on_image_fetched(self, row, data):
+        if data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setPixmap(pixmap.scaled(75, 75, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.tab.setCellWidget(row, 1, lbl)
+        else:
+            lbl = self.tab.cellWidget(row, 1)
+            if lbl: lbl.setText("加载失败")
+
+    def toggle_select_all(self):
+        if self.tab.rowCount() == 0: return
+        first_state = self.tab.item(0, 0).checkState()
+        new_state = Qt.Checked if first_state == Qt.Unchecked else Qt.Unchecked
+        for r in range(self.tab.rowCount()):
+            self.tab.item(r, 0).setCheckState(new_state)
+
+    def copy_selected(self):
+        titles = []
+        for r in range(self.tab.rowCount()):
+            if self.tab.item(r, 0).checkState() == Qt.Checked:
+                titles.append(self.tab.item(r, 3).text().strip())
+
+        if titles:
+            QApplication.clipboard().setText("\n".join(titles))
+            QMessageBox.information(self, "复制成功",
+                                    f"成功复制 {len(titles)} 条勾选的中文名！\n请前往翻译软件粘贴翻译。")
+        else:
+            QMessageBox.warning(self, "提示", "您目前没有勾选任何数据！")
+
+    def copy_all(self):
+        titles = []
+        for r in range(self.tab.rowCount()):
+            titles.append(self.tab.item(r, 3).text().strip())
+
+        if titles:
+            QApplication.clipboard().setText("\n".join(titles))
+            QMessageBox.information(self, "复制成功",
+                                    f"成功一键复制全部 {len(titles)} 条中文名！\n请前往翻译软件粘贴翻译。")
+
+    def open_match_dialog(self):
+        if self.tab.rowCount() == 0:
+            QMessageBox.warning(self, "错误", "请先加载数据！")
+            return
+
+        d = QDialog(self)
+        d.setWindowTitle("粘贴标题匹配 (终极智能捕捉版)")
+        d.resize(550, 400)
+        v = QVBoxLayout(d)
+        v.addWidget(QLabel("直接粘贴您的内容（无视特殊符号或换行，只要包含中文即可100%匹配提取翻译）:"))
+        te = QTextEdit()
+        te.setAcceptRichText(False)
+        v.addWidget(te)
+        btn = QPushButton("开启智能捕捉并覆盖表格")
+        v.addWidget(btn)
+
+        def run_match():
+            raw = te.toPlainText().strip()
+            if not raw: return
+
+            match_count = 0
+            lines = raw.split('\n')
+            row_matchers = []
+
+            for r in range(self.tab.rowCount()):
+                table_cn = self.tab.item(r, 3).text().strip()
+                chars = re.findall(r'[\w\u4e00-\u9fa5]', table_cn)
+                if chars:
+                    pattern = r'^\W*' + r'\W*'.join([re.escape(c) for c in chars]) + r'\W*'
+                    regex = re.compile(pattern, re.IGNORECASE)
+                    row_matchers.append((r, regex))
+
+            for l in lines:
+                l = l.strip()
+                if not l: continue
+                for r, regex in row_matchers:
+                    match = regex.match(l)
+                    if match:
+                        en = l[match.end():].strip()
+                        if en:
+                            self.tab.setItem(r, 4, QTableWidgetItem(en))
+                            self.tab.item(r, 4).setBackground(Qt.green)
+                            self.tab.setItem(r, 5, QTableWidgetItem("✨ 新匹配"))
+                            match_count += 1
+                        break
+
+            d.accept()
+            if match_count > 0:
+                QMessageBox.information(self, "匹配成功",
+                                        f"✅ 智能捕捉完成！成功填入 {match_count} 条数据！\n记得点击【保存匹配结果】！")
+            else:
+                QMessageBox.warning(self, "匹配失败", "⚠️ 匹配结果为 0 条！")
+
+        btn.clicked.connect(run_match)
+        d.exec_()
+
+    def save_data(self):
+        if self.tab.rowCount() == 0: return
+        data = []
+        for r in range(self.tab.rowCount()):
+            sku = self.tab.item(r, 2).text().strip()
+            en = self.tab.item(r, 4).text().strip() if self.tab.item(r, 4) else ""
+            if en: data.append({"SKU": sku, "Title_EN": en})
+
+        if data:
+            save_path = Path(Config.RESULT_DIR) / "4_自定义标题.xlsx"
+            Utils.atomic_save(pd.DataFrame(data), save_path)
+            self.main_window.log_box.append(f"💾 成功保存 {len(data)} 个自定义外语标题！")
+            QMessageBox.information(self, "成功", "保存成功！去生成导入表格时会自动采用这里的标题。")
+
+
+class PreviewTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.df_img = None
+        self.family_map = {}
+        self.current_child_sku = None
+        self.initUI()
+
+    def initUI(self):
+        main_layout = QVBoxLayout(self)
+
+        top_layout = QHBoxLayout()
+        self.btn_load = QPushButton("🔄 1. 刷新加载最新数据")
+        self.btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
+        self.btn_load.clicked.connect(self.load_data)
+
+        self.btn_generate_final = QPushButton("🚀 3. 完成修图/翻译：重新生成导入表")
+        self.btn_generate_final.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
+        self.btn_generate_final.clicked.connect(self.generate_final)
+
+        top_layout.addWidget(self.btn_load)
+        top_layout.addWidget(self.btn_generate_final)
+        main_layout.addLayout(top_layout)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(QLabel("选择父产品 (Parent SKU):"))
+        self.list_parents = QListWidget()
+        self.list_parents.itemSelectionChanged.connect(self.on_parent_selected)
+        left_layout.addWidget(self.list_parents)
+
+        left_widget_2 = QWidget()
+        left_layout_2 = QVBoxLayout(left_widget_2)
+        left_layout.addWidget(QLabel("查看子变种 (Child SKU):"))
+        self.list_children = QListWidget()
+        self.list_children.setIconSize(QSize(55, 55))
+        self.list_children.setStyleSheet("QListWidget::item { padding: 5px; }")
+        self.list_children.itemSelectionChanged.connect(self.on_child_selected)
+        left_layout.addWidget(self.list_children)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        child_layout = QHBoxLayout()
+        self.lbl_current_sku = QLabel("当前精修变种: 未选择")
+        self.lbl_current_sku.setStyleSheet("font-weight: bold; font-size: 14px; color: #E91E63;")
+        child_layout.addWidget(self.lbl_current_sku)
+
+        self.btn_save_sku = QPushButton("💾 2. 一键覆盖保存当前图片顺序至文件")
+        self.btn_save_sku.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        self.btn_save_sku.clicked.connect(self.save_current_sku)
+        child_layout.addWidget(self.btn_save_sku)
+        right_layout.addLayout(child_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        grid_widget = QWidget()
+        self.grid_layout = QGridLayout(grid_widget)
+
+        self.image_slots = {}
+        self.ordered_cols = [f"图{i}" for i in range(1, 10)] + ["SKU图(第10列)"]
+        titles = [f"【主/附图 {i}】" for i in range(1, 10)] + ["【变种缩略图】"]
+
+        for i, (col, title) in enumerate(zip(self.ordered_cols, titles)):
+            slot = ImageSlotWidget(title, col)
+            slot.delete_requested.connect(self.shift_images_forward)
+            self.image_slots[col] = slot
+            row = i // 5
+            col_idx = i % 5
+            self.grid_layout.addWidget(slot, row, col_idx)
+
+        scroll.setWidget(grid_widget)
+        right_layout.addWidget(scroll)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([250, 850])
+        main_layout.addWidget(splitter)
+
+    def load_data(self):
+        base_path = Path(Config.RESULT_DIR) / "0_合并后底表.xlsx"
+        img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+
+        if not base_path.exists() or not img_path.exists():
+            QMessageBox.warning(self, "错误", "未找到基础数据或图片数据，请先在【自动抓取页】执行一次抓取！")
+            return
+
+        try:
+            df_base = pd.read_excel(base_path)
+            self.family_map.clear()
+            for _, row in df_base.iterrows():
+                sku = str(row['SKU']).strip()
+                parent = sku.split('-')[0] if '-' in sku else sku
+                if parent not in self.family_map: self.family_map[parent] = []
+                self.family_map[parent].append(sku)
+
+            self.df_img = pd.read_excel(img_path)
+            target = None
+            for c in self.df_img.columns:
+                if 'sku' in str(c).lower(): target = c; break
+            if target and target != 'SKU': self.df_img.rename(columns={target: 'SKU'}, inplace=True)
+            self.df_img['SKU'] = self.df_img['SKU'].astype(str).str.strip()
+            self.df_img.set_index('SKU', inplace=True)
+
+            self.list_parents.clear()
+            parents = sorted(list(self.family_map.keys()))
+            self.list_parents.addItems(parents)
+
+            self.main_window.log_box.append("✔️ 图片数据已成功加载到预览页！")
+            QMessageBox.information(self, "成功", "最新图片数据加载成功！")
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"错误信息: {e}")
+
+    def on_parent_selected(self):
+        items = self.list_parents.selectedItems()
+        if not items: return
+        parent = items[0].text()
+
+        self.list_children.blockSignals(True)
+        self.list_children.clear()
+        children = self.family_map.get(parent, [])
+
+        fetch_list = []
+        for i, child_sku in enumerate(children):
+            item = QListWidgetItem(child_sku)
+            self.list_children.addItem(item)
+
+            url = ""
+            if child_sku in self.df_img.index:
+                row = self.df_img.loc[child_sku]
+                url = str(row.get('SKU图(第10列)', '')).strip()
+                if not url or url.lower() == 'nan':
+                    url = str(row.get('图1', '')).strip()
+            if url and url.lower() != 'nan':
+                fetch_list.append((i, url))
+
+        self.list_children.blockSignals(False)
+
+        if fetch_list:
+            self.fetcher = BatchImageFetcher(fetch_list)
+            self.fetcher.image_fetched.connect(self.on_child_icon_fetched)
+            self.fetcher.start()
+
+        if children:
+            self.list_children.setCurrentRow(0)
+            self.on_child_selected()
+
+    def on_child_icon_fetched(self, row, data):
+        if data and row < self.list_children.count():
+            item = self.list_children.item(row)
+            if item:
+                pixmap = QPixmap()
+                pixmap.loadFromData(data)
+                icon = QIcon(pixmap.scaled(60, 60, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                item.setIcon(icon)
+
+    def on_child_selected(self):
+        items = self.list_children.selectedItems()
+        if not items: return
+        child_sku = items[0].text()
+        self.current_child_sku = child_sku
+        self.lbl_current_sku.setText(f"当前精修变种: {child_sku}")
+
+        if child_sku in self.df_img.index:
+            row = self.df_img.loc[child_sku]
+            for col, slot in self.image_slots.items():
+                url = row.get(col, "") if col in self.df_img.columns else ""
+                slot.set_data(url)
+        else:
+            for slot in self.image_slots.values():
+                slot.set_data("")
+
+    def shift_images_forward(self, deleted_col):
+        if deleted_col == "SKU图(第10列)":
+            self.image_slots[deleted_col].set_data("")
+            self.main_window.log_box.append(f"🔄 变种缩略图已清空！请记得点击[覆盖保存]。")
+            return
+
+        main_cols = [f"图{i}" for i in range(1, 10)]
+        new_urls = []
+        for col in main_cols:
+            if col == deleted_col: continue
+            url = self.image_slots[col].txt_url.text().strip()
+            if url: new_urls.append(url)
+
+        while len(new_urls) < 9: new_urls.append("")
+
+        for i, col in enumerate(main_cols):
+            self.image_slots[col].set_data(new_urls[i])
+
+        self.main_window.log_box.append(f"🔄 主图已自动填补空位并前移（变种图位置保持不变）！请记得点击[覆盖保存]。")
+
+    def save_current_sku(self):
+        if not self.current_child_sku or self.df_img is None: return
+
+        if self.current_child_sku not in self.df_img.index:
+            self.df_img.loc[self.current_child_sku] = ""
+
+        for col, slot in self.image_slots.items():
+            self.df_img.at[self.current_child_sku, col] = slot.txt_url.text().strip()
+
+        try:
+            img_path = Path(Config.RESULT_DIR) / "1_图片结果.xlsx"
+            df_to_save = self.df_img.reset_index()
+            Utils.atomic_save(df_to_save, img_path)
+            self.main_window.log_box.append(f"💾 变种 {self.current_child_sku} 已经覆盖保存至 1_图片结果.xlsx！")
+            QMessageBox.information(self, "成功", f"变种 {self.current_child_sku} 的图片顺序与修改已永久保存！")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"错误信息: {e}")
+
+    def generate_final(self):
+        self.main_window.trigger_merge_only()
+
+
+# ----------------- 新增 Tab 4: 导出模板配置 UI -----------------
+class TemplateConfigTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.template_path = ""
+        self.external_headers = []
+        self.initUI()
+        self.load_existing_mapping()
+
+    def initUI(self):
+        lay = QVBoxLayout(self)
+
+        top_box = QGroupBox("外部模板上传与识别")
+        top_lay = QHBoxLayout()
+
+        self.btn_select = QPushButton("📂 1. 上传外部 ERP/平台 空白模板")
+        self.btn_select.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        self.btn_select.clicked.connect(self.select_template)
+
+        top_lay.addWidget(QLabel("表头所在行(默认第1行):"))
+        self.spin_row = QSpinBox()
+        self.spin_row.setMinimum(1)
+        self.spin_row.setMaximum(10)
+        self.spin_row.setValue(1)
+        self.spin_row.valueChanged.connect(self.preview_header)
+        top_lay.addWidget(self.spin_row)
+
+        self.lbl_preview = QLabel("预览: [请上传模板]")
+        self.lbl_preview.setStyleSheet("color: #666; font-style: italic;")
+        top_lay.addWidget(self.lbl_preview)
+
+        self.btn_automatch = QPushButton("✨ 2. AI 智能连线识别")
+        self.btn_automatch.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold; padding: 8px;")
+        self.btn_automatch.clicked.connect(self.auto_match)
+
+        top_lay.addWidget(self.btn_select)
+        top_lay.addWidget(self.btn_automatch)
+        top_lay.addStretch()
+        top_box.setLayout(top_lay)
+        lay.addWidget(top_box)
+
+        self.map_table = QTableWidget(len(TemplateManager.INTERNAL_FIELDS), 3)
+        self.map_table.setHorizontalHeaderLabels(
+            ["系统内部字段 (红色带*为必填项)", "对应外部模板表头 (支持下拉微调)", "匹配状态"])
+        self.map_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.map_table.setSelectionMode(QTableWidget.NoSelection)
+        lay.addWidget(self.map_table)
+
+        bottom_lay = QHBoxLayout()
+        self.btn_save = QPushButton("💾 3. 保存并应用当前模板配置")
+        self.btn_save.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; padding: 12px; font-size: 14px;")
+        self.btn_save.clicked.connect(self.save_mapping)
+        bottom_lay.addWidget(self.btn_save)
+        lay.addLayout(bottom_lay)
+
+    def load_existing_mapping(self):
+        mapping = TemplateManager.get_current_mapping()
+        self.external_headers = list(set(mapping.values()))
+        if "" in self.external_headers: self.external_headers.remove("")
+
+        for i, (int_key, (disp_name, is_req)) in enumerate(TemplateManager.INTERNAL_FIELDS.items()):
+            display_text = f"* {disp_name}" if is_req else disp_name
+            item = QTableWidgetItem(display_text)
+            if is_req: item.setForeground(Qt.red)
+            self.map_table.setItem(i, 0, item)
+
+            combo = QComboBox()
+            combo.addItem("—— 留空不填(系统自动过滤) ——")
+            combo.addItems(self.external_headers)
+
+            saved_val = mapping.get(int_key, "")
+            if saved_val:
+                idx = combo.findText(saved_val)
+                if idx >= 0: combo.setCurrentIndex(idx)
+
+            self.map_table.setCellWidget(i, 1, combo)
+            self.map_table.setItem(i, 2, QTableWidgetItem("✔️ 已加载预设" if saved_val else "——"))
+
+    def select_template(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择空白模板文件", "", "Excel Files (*.xlsx *.xls *.csv)")
+        if path:
+            self.template_path = path
+            self.preview_header()
+
+    def preview_header(self):
+        if not self.template_path: return
+        row_idx = self.spin_row.value() - 1
+        try:
+            if self.template_path.endswith('.csv'):
+                df = pd.read_csv(self.template_path, header=row_idx)
+            else:
+                df = pd.read_excel(self.template_path, header=row_idx)
+            self.external_headers = [str(c) for c in df.columns if not str(c).startswith('Unnamed:')]
+            preview_text = " | ".join(self.external_headers[:5]) + " ..."
+            self.lbl_preview.setText(f"预览: {preview_text}")
+        except Exception as e:
+            self.lbl_preview.setText("读取失败，请检查行数或文件格式")
+
+    def auto_match(self):
+        if not self.external_headers:
+            QMessageBox.warning(self, "警告", "请先上传并预览正确的外部模板！")
+            return
+
+        for i, (int_key, (disp_name, is_req)) in enumerate(TemplateManager.INTERNAL_FIELDS.items()):
+            combo = QComboBox()
+            combo.addItem("—— 留空不填(系统自动过滤) ——")
+            combo.addItems(self.external_headers)
+
+            best_match = ""
+            best_score = 0
+            keywords = TemplateManager.FUZZY_DICT.get(int_key, [disp_name])
+
+            for ext_h in self.external_headers:
+                clean_ext = ext_h.lower()
+                for kw in keywords:
+                    ratio = difflib.SequenceMatcher(None, kw.lower(), clean_ext).ratio()
+                    if kw.lower() in clean_ext: ratio += 0.4
+                    if ratio > best_score and ratio > 0.5:
+                        best_score = ratio
+                        best_match = ext_h
+
+            if best_match:
+                idx = combo.findText(best_match)
+                if idx >= 0: combo.setCurrentIndex(idx)
+
+            self.map_table.setCellWidget(i, 1, combo)
+
+            status_item = QTableWidgetItem("✨ AI自动匹配" if best_match else "⏳ 未匹配")
+            if best_match: status_item.setForeground(Qt.blue)
+            self.map_table.setItem(i, 2, status_item)
+
+        QMessageBox.information(self, "识别完成", "AI 智能连线完毕！请检查下拉框，可做人工微调修正。")
+
+    def save_mapping(self):
+        new_mapping = {}
+        missing_required = []
+
+        for i, (int_key, (disp_name, is_req)) in enumerate(TemplateManager.INTERNAL_FIELDS.items()):
+            combo = self.map_table.cellWidget(i, 1)
+            selected = combo.currentText()
+
+            if selected.startswith("——"):
+                new_mapping[int_key] = ""
+                if is_req: missing_required.append(disp_name)
+            else:
+                new_mapping[int_key] = selected
+
+        if missing_required:
+            msg = "⛔ 【防呆拦截】以下核心必填字段被您留空了：\n\n" + "\n".join(
+                missing_required) + "\n\n请在下拉框中为它们指定对应的外部表头！"
+            QMessageBox.critical(self, "配置错误", msg)
+            return
+
+        TemplateManager.save_mapping(new_mapping)
+        self.main_window.log_box.append("💾 动态模板配置已永久保存！")
+        QMessageBox.information(self, "保存成功", "✅ 模板配置已生效！下次生成最终表格时，将自动使用该表头结构。")
+
+
+# ----------------- 主窗口类 -----------------
+class EmittingStream(QObject):
+    textWritten = pyqtSignal(str)
+
+    def write(self, text):
+        if str(text).strip(): self.textWritten.emit(str(text))
+
+    def flush(self): pass
+
+
+class AppWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("CHUYA/Blue Aura 饰品上新中枢系统 v4.0 (支持全平台模板动态映射)")
+        self.resize(1300, 900)
+
+        sys.stdout = EmittingStream(textWritten=self.normalOutputWritten)
+        sys.stderr = EmittingStream(textWritten=self.normalOutputWritten)
+
+        self.initUI()
+
+    def initUI(self):
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        self.tab1 = QWidget()
+        self.setup_tab1()
+        self.tabs.addTab(self.tab1, "1. 自动抓取与合并")
+
+        self.tab2 = PreviewTab(self)
+        self.tabs.addTab(self.tab2, "2. 图片预览与人工精修")
+
+        self.tab3 = TitleMatchTab(self)
+        self.tabs.addTab(self.tab3, "3. 批量翻译与智能标题匹配")
+
+        self.tab4 = TemplateConfigTab(self)
+        self.tabs.addTab(self.tab4, "4. ⚙️ 导出模板配置 (全平台适配)")
+
+    def setup_tab1(self):
+        main_layout = QVBoxLayout(self.tab1)
+        path_layout = QHBoxLayout()
+        self.path_label = QLabel("当前新品源文件夹: 尚未选择")
+        self.path_label.setStyleSheet("font-weight: bold;")
+        btn_select_dir = QPushButton("📂 选择文件夹")
+        btn_select_dir.clicked.connect(self.select_directory)
+        path_layout.addWidget(self.path_label)
+        path_layout.addWidget(btn_select_dir)
+        main_layout.addLayout(path_layout)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet("background-color: #1e1e1e; color: #00FF00; font-family: Consolas;")
+        main_layout.addWidget(QLabel("运行日志:"))
+        main_layout.addWidget(self.log_box)
+
+        self.btn_start = QPushButton("▶ 开始自动抓取任务")
+        self.btn_start.setStyleSheet(
+            "background-color: #4CAF50; color: white; padding: 12px; font-weight: bold; font-size: 14px;")
+        self.btn_start.clicked.connect(self.start_task)
+        main_layout.addWidget(self.btn_start)
+        self.selected_dir = ""
+
+    def normalOutputWritten(self, text):
+        cursor = self.log_box.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.insertText(text + "\n")
+        self.log_box.setTextCursor(cursor)
+        self.log_box.ensureCursorVisible()
+
+    def select_directory(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "选择新品源文件", Config.BASE_DIR)
+        if dir_path:
+            self.selected_dir = dir_path
+            self.path_label.setText(f"当前文件夹: {self.selected_dir}")
+
+    def start_task(self):
+        if not self.selected_dir:
+            print("❌ 请先点击左上方【选择文件夹】！")
+            return
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("⏳ 正在运行中，请勿关闭...")
+        self.worker = WorkerThread(self.selected_dir)
+        self.worker.finished_signal.connect(self.task_finished)
+        self.worker.start()
+
+    def trigger_merge_only(self):
+        self.tabs.setCurrentIndex(0)
+        self.btn_start.setEnabled(False)
+        self.merge_thread = MergeOnlyThread()
+        self.merge_thread.finished_signal.connect(self.task_finished)
+        self.merge_thread.start()
+
+    def task_finished(self):
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("▶ 开始自动抓取任务")
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = AppWindow()
+    window.show()
+    sys.exit(app.exec_())

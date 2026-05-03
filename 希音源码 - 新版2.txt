@@ -1,0 +1,672 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog, Toplevel
+import pandas as pd
+import io
+import datetime
+import os
+import re
+import urllib.parse
+import requests
+import webbrowser
+from PIL import Image, ImageTk
+from sqlalchemy import create_engine, text
+import threading
+
+# ================= ⚙️ 系统配置 =================
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 3306,
+    'user': 'python_user',
+    'password': 'py123456',
+    'database': 'shein_data_center'
+}
+
+DEFAULT_SAVE_DIR = r'D:\Desktop\希音新品监控'
+
+POSSIBLE_CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+]
+
+# 🛒 饰品品类映射字典
+CATEGORY_MAP = {
+    'Earrings': ['earring', 'stud', 'hoop', 'ear', 'clip'],
+    'Necklaces': ['necklace', 'choker', 'pendant', 'chain', 'collar'],
+    'Rings': ['ring', 'finger', 'band'],
+    'Bracelets': ['bracelet', 'bangle', 'wrist'],
+    'Anklets': ['anklet', 'ankle'],
+    'Hair Acc': ['hair', 'clip', 'band', 'scrunchie', 'tiara'],
+    'Body Jewelry': ['body', 'piercing', 'belly', 'nose'],
+    'Sets': ['set', 'pcs']
+}
+
+# 🟢【底层搜索基础 URL】
+SHEIN_SEARCH_BASE = "https://us.shein.com/pdsearch/Jewelry/"
+
+# 🟢【提取脚本内容】
+JS_EXTRACTION_CODE = r'''(function() {
+    console.clear();
+    console.log("🚀 开始提取数据...");
+
+    // 定义表头
+    let csvContent = "标题,价格,图片链接,商品详情页\n";
+    // 1. 尝试定位所有的商品卡片
+    let items = document.querySelectorAll('.product-list__item');
+    // 备用方案
+    if (items.length < 10) {
+         items = document.querySelectorAll('section > div');
+    }
+
+    let count = 0;
+
+    items.forEach((item) => {
+        try {
+            // --- A. 抓标题 ---
+            let titleEl = item.querySelector('a') || item.querySelector('.goods-title-link');
+            let title = titleEl ? (titleEl.getAttribute('aria-label') || titleEl.innerText) : "未知标题";
+            title = title.replace(/,/g, " ").replace(/\n/g, "").trim();
+
+            // --- B. 抓链接 ---
+            let linkEl = item.querySelector('a');
+            let linkUrl = linkEl ? linkEl.href : "";
+
+            // --- C. 抓图片 ---
+            let imgEl = item.querySelector('img');
+            let imgUrl = "";
+            if (imgEl) {
+                imgUrl = imgEl.getAttribute('data-src') || imgEl.src;
+                if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
+            }
+
+            // --- D. 抓价格 ---
+            let priceEl = item.querySelector('[class*="price"]'); 
+            let price = priceEl ? priceEl.innerText.replace(/\n/g, "") : "0";
+
+            // 有效性检查
+            if (title !== "未知标题" && imgUrl !== "") {
+                csvContent += `${title},${price},${imgUrl},${linkUrl}\n`;
+                count++;
+            }
+        } catch (err) {
+            // 跳过错误
+        }
+    });
+    console.log(`✅ 提取完成！共找到 ${count} 个商品。`);
+    console.log("👇 请直接复制下面分割线内的所有内容：");
+    console.log("---------------------------------------------------");
+    console.log(csvContent);
+    console.log("---------------------------------------------------");
+})();'''
+
+
+# ===============================================
+
+class SheinDBMaster:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Shein 选品作战指挥台 (双轨战略版 + MOTF高端线)")
+        self.root.geometry("1100x850")
+
+        self.engine = self.connect_db()
+
+        if not os.path.exists(DEFAULT_SAVE_DIR):
+            try:
+                os.makedirs(DEFAULT_SAVE_DIR)
+            except:
+                pass
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(pady=10, expand=True, fill='both')
+
+        self.tab1 = ttk.Frame(self.notebook)
+        self.tab2 = ttk.Frame(self.notebook)
+        self.tab3 = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab1, text='  📥 Step 1: 多源入库 (含MOTF)  ')
+        self.notebook.add(self.tab2, text='  🚀 Step 2: 自由趋势分析  ')
+        self.notebook.add(self.tab3, text='  📊 Step 3: 品类风向标  ')
+
+        self.setup_tab1()
+        self.setup_tab2()
+        self.setup_tab3()
+
+        status_msg = "✅ 数据库连接正常" if self.engine else "❌ 数据库连接失败"
+        self.status_var = tk.StringVar(value=status_msg)
+        tk.Label(root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM,
+                                                                                               fill=tk.X)
+
+    def connect_db(self):
+        try:
+            safe_pwd = urllib.parse.quote_plus(DB_CONFIG['password'])
+            conn_str = f"mysql+pymysql://{DB_CONFIG['user']}:{safe_pwd}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}?charset=utf8mb4"
+            engine = create_engine(conn_str)
+            with engine.connect() as conn:
+                pass
+            return engine
+        except Exception as e:
+            messagebox.showerror("连接错误", f"数据库连接失败:\n{e}")
+            return None
+
+    # ================= 🟢 核心功能：复制脚本 & URL生成 =================
+    def copy_extraction_code(self):
+        """将JS代码复制到剪贴板"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(JS_EXTRACTION_CODE)
+        self.root.update()
+        messagebox.showinfo("复制成功",
+                            "✅ 提取脚本已复制到剪贴板！\n\n"
+                            "👉 操作步骤：\n"
+                            "1. 在 Chrome 浏览器中按 F12 打开开发者工具\n"
+                            "2. 切换到 'Console' (控制台) 标签\n"
+                            "3. 按 Ctrl+V 粘贴代码并回车运行\n"
+                            "4. 复制控制台输出的结果，粘贴回本软件的文本框")
+
+    def get_shein_search_url(self, list_type, page, is_zinc=True):
+        """生成 Shein 搜索链接"""
+        if list_type == "MOTF":
+            base = "https://us.shein.com/pdsearch/MOTF%20Jewelry/"
+            url = base + f"?sort=9&page={page}"
+            if is_zinc:
+                url += "&attr_values=Zinc%20Alloy"
+            return url
+
+        sort_map = {"NEW": 9, "HOT": 8}
+        sort_value = sort_map.get(list_type, 9)
+        url = SHEIN_SEARCH_BASE + "?"
+        if is_zinc: url += "attr_values=Zinc%20Alloy&"
+        url += f"sort={sort_value}&page={page}"
+        return url
+
+    def open_top_pages(self, list_type, is_zinc, pages=3):
+        if not self.engine: pass
+        for page in range(1, pages + 1):
+            url = self.get_shein_search_url(list_type, page, is_zinc)
+            if url:
+                threading.Thread(target=self.open_chrome_url, args=(url,), daemon=True).start()
+
+        filter_text = "【🔒 锁定锌合金】" if is_zinc else "【🌍 全材质大盘】"
+        if list_type == "NEW":
+            list_name = "新品榜"
+        elif list_type == "HOT":
+            list_name = "热销榜"
+        else:
+            list_name = "MOTF高端线"
+
+        messagebox.showinfo("执行完毕",
+                            f"已打开 {filter_text} {list_name} 的前 {pages} 页。\n\n请在网页加载完毕后，使用【复制提取脚本】功能抓取数据。")
+
+    # ================= Tab 1: 多源数据入库 =================
+    def setup_tab1(self):
+        f_top = tk.Frame(self.tab1, pady=10)
+        f_top.pack(fill="x", padx=15)
+
+        tk.Label(f_top, text="📅 入库日期:", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
+        self.entry_date = tk.Entry(f_top, width=15)
+        self.entry_date.pack(side=tk.LEFT, padx=10)
+        self.entry_date.insert(0, str(datetime.date.today()))
+
+        tk.Label(f_top, text="   📡 数据来源:", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
+        self.source_type = tk.StringVar(value="NEW")
+
+        rb_new = tk.Radiobutton(f_top, text="新品榜 (New Arrivals)", variable=self.source_type, value="NEW",
+                                font=("微软雅黑", 10))
+        rb_new.pack(side=tk.LEFT, padx=5)
+        rb_hot = tk.Radiobutton(f_top, text="热销榜 (Best Sellers)", variable=self.source_type, value="HOT",
+                                font=("微软雅黑", 10), fg="red")
+        rb_hot.pack(side=tk.LEFT, padx=5)
+        rb_motf = tk.Radiobutton(f_top, text="MOTF (高端线)", variable=self.source_type, value="MOTF",
+                                 font=("微软雅黑", 10, "bold"), fg="#9C27B0")
+        rb_motf.pack(side=tk.LEFT, padx=5)
+
+        f_quick_btns = tk.Frame(f_top, padx=10, bd=1, relief=tk.GROOVE)
+        f_quick_btns.pack(side=tk.RIGHT)
+
+        # 第一行
+        f_row1 = tk.Frame(f_quick_btns)
+        f_row1.pack(fill="x", pady=1)
+        tk.Label(f_row1, text="🔒 锌合金:", font=("Arial", 9, "bold"), fg="#4CAF50").pack(side=tk.LEFT)
+        tk.Button(f_row1, text="新品", command=lambda: self.open_top_pages("NEW", True)).pack(side=tk.LEFT)
+        tk.Button(f_row1, text="热销", command=lambda: self.open_top_pages("HOT", True)).pack(side=tk.LEFT)
+
+        # 第二行
+        f_row2 = tk.Frame(f_quick_btns)
+        f_row2.pack(fill="x", pady=1)
+        tk.Label(f_row2, text="🌍 全材质:", font=("Arial", 9, "bold"), fg="#2196F3").pack(side=tk.LEFT)
+        tk.Button(f_row2, text="新品", command=lambda: self.open_top_pages("NEW", False)).pack(side=tk.LEFT)
+        tk.Button(f_row2, text="热销", command=lambda: self.open_top_pages("HOT", False)).pack(side=tk.LEFT)
+
+        # 第三行
+        f_row3 = tk.Frame(f_quick_btns)
+        f_row3.pack(fill="x", pady=1)
+        tk.Label(f_row3, text="💎 MOTF:  ", font=("Arial", 9, "bold"), fg="#9C27B0").pack(side=tk.LEFT)
+        tk.Button(f_row3, text="浏览专区", bg="#F3E5F5", command=lambda: self.open_top_pages("MOTF", False)).pack(
+            side=tk.LEFT, padx=2)
+
+        frame_txt = tk.LabelFrame(self.tab1, text="通道 A: 粘贴 CSV 文本", padx=15, pady=10)
+        frame_txt.pack(fill="both", expand=True, padx=10, pady=5)
+
+        f_txt_tools = tk.Frame(frame_txt)
+        f_txt_tools.pack(fill="x", pady=2)
+        tk.Label(f_txt_tools, text="将Chrome控制台数据粘贴于此:", fg="gray").pack(side=tk.LEFT)
+        tk.Button(f_txt_tools, text="📋 复制控制台提取脚本 (JS)", bg="#607D8B", fg="white", font=("微软雅黑", 9),
+                  command=self.copy_extraction_code).pack(side=tk.RIGHT)
+
+        self.txt_input = scrolledtext.ScrolledText(frame_txt, height=8)
+        self.txt_input.pack(fill="both", expand=True, pady=5)
+        tk.Button(frame_txt, text="📥 执行文本入库", bg="#4CAF50", fg="white", font=("微软雅黑", 10, "bold"),
+                  command=self.save_text_to_db).pack(fill="x")
+
+        frame_file = tk.LabelFrame(self.tab1, text="通道 B: 上传表格文件", padx=15, pady=10)
+        frame_file.pack(fill="x", padx=10, pady=10)
+        f_sel = tk.Frame(frame_file)
+        f_sel.pack(fill="x", pady=5)
+        self.path_var = tk.StringVar()
+        tk.Entry(f_sel, textvariable=self.path_var).pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        tk.Button(f_sel, text="📂 浏览文件...", command=self.select_file).pack(side=tk.LEFT)
+        tk.Button(frame_file, text="🚀 执行文件导入", bg="#2196F3", fg="white", font=("微软雅黑", 10, "bold"),
+                  command=self.save_file_to_db).pack(fill="x", pady=5)
+
+    def select_file(self):
+        f = filedialog.askopenfilename(initialdir=DEFAULT_SAVE_DIR, filetypes=[("Excel/CSV", "*.xlsx *.csv")])
+        if f: self.path_var.set(f)
+
+    def common_db_insert(self, df, target_date, data_type):
+        if 'title' in df.columns:
+            df = df[~df['title'].astype(str).str.contains('---', na=False)]
+            df = df[df['title'].astype(str) != '标题']
+        df = df.dropna(how='all')
+        rename_map = {'标题': 'title', '价格': 'price', '图片链接': 'img_url', '商品详情页': 'detail_url',
+                      '排名': 'rank_index'}
+        df.rename(columns=rename_map, inplace=True)
+        if 'img_url' not in df.columns: raise ValueError("缺少【图片链接】列")
+        df.drop_duplicates(subset=['img_url'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df['record_date'] = target_date
+        df['data_type'] = data_type
+        if 'rank_index' not in df.columns: df['rank_index'] = df.index + 1
+        if 'price' in df.columns:
+            df['price'] = df['price'].astype(str).str.replace(r'[^\d.]', '', regex=True)
+            df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0)
+        with self.engine.connect() as conn:
+            stmt = text("DELETE FROM daily_rankings WHERE record_date = :d AND data_type = :t")
+            conn.execute(stmt, {"d": target_date, "t": data_type})
+            conn.commit()
+        valid_cols = ['record_date', 'rank_index', 'title', 'price', 'img_url', 'detail_url', 'data_type']
+        save_df = df[[c for c in df.columns if c in valid_cols]].copy()
+        save_df.to_sql('daily_rankings', self.engine, if_exists='append', index=False)
+        return len(save_df)
+
+    def save_text_to_db(self):
+        if not self.engine: return
+        content = self.txt_input.get(1.0, tk.END).strip()
+        date_str = self.entry_date.get()
+        d_type = self.source_type.get()
+        if not content: return messagebox.showwarning("提示", "文本框为空！")
+        try:
+            df = pd.read_csv(io.StringIO(content), header=None, names=['title', 'price', 'img_url', 'detail_url'],
+                             on_bad_lines='skip')
+            count = self.common_db_insert(df, date_str, d_type)
+            messagebox.showinfo("成功", f"【{d_type}】榜单入库成功！\n日期: {date_str}\n数量: {count}")
+            self.load_dates()
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+
+    def save_file_to_db(self):
+        if not self.engine: return
+        f_path = self.path_var.get()
+        if not f_path: return messagebox.showwarning("提示", "请选择文件！")
+        d_type = self.source_type.get()
+        try:
+            basename = os.path.basename(f_path)
+            match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
+            target_date = match.group(1) if match else self.entry_date.get()
+            if f_path.endswith('.csv'):
+                df = pd.read_csv(f_path)
+            else:
+                df = pd.read_excel(f_path)
+            count = self.common_db_insert(df, target_date, d_type)
+            messagebox.showinfo("成功", f"【{d_type}】文件入库成功！\n日期: {target_date}\n数量: {count}")
+            self.load_dates()
+        except Exception as e:
+            messagebox.showerror("失败", str(e))
+
+    # ================= Tab 2: 自由趋势分析 =================
+    def setup_tab2(self):
+        frame = tk.Frame(self.tab2, padx=20, pady=20)
+        frame.pack(fill="both", expand=True)
+        f_header = tk.Frame(frame)
+        f_header.pack(fill="x", pady=10)
+        tk.Label(f_header, text="🔥 自由趋势分析", font=("微软雅黑", 16, "bold"), fg="#FF5722").pack(side=tk.LEFT)
+        tk.Label(f_header, text="   | 分析目标:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+
+        self.analyze_type = tk.StringVar(value="NEW")
+        tk.Radiobutton(f_header, text="新品榜", variable=self.analyze_type, value="NEW", command=self.load_dates).pack(
+            side=tk.LEFT)
+        tk.Radiobutton(f_header, text="热销榜", variable=self.analyze_type, value="HOT", command=self.load_dates).pack(
+            side=tk.LEFT)
+        tk.Radiobutton(f_header, text="MOTF (高端)", variable=self.analyze_type, value="MOTF", command=self.load_dates,
+                       fg="#9C27B0").pack(side=tk.LEFT)
+
+        f_sel = tk.LabelFrame(frame, text="对比设定", padx=15, pady=15)
+        f_sel.pack(fill="x", pady=10)
+        f_row1 = tk.Frame(f_sel)
+        f_row1.pack(fill="x", pady=5)
+        tk.Label(f_row1, text="1. 目标日期:", width=15, anchor="e").pack(side=tk.LEFT)
+        self.combo_target = ttk.Combobox(f_row1, state="readonly", width=20)
+        self.combo_target.pack(side=tk.LEFT, padx=10)
+        self.combo_target.bind("<<ComboboxSelected>>", self.auto_match_benchmark)
+        f_row2 = tk.Frame(f_sel)
+        f_row2.pack(fill="x", pady=5)
+        tk.Label(f_row2, text="2. 基准日期:", width=15, anchor="e").pack(side=tk.LEFT)
+        self.combo_bench = ttk.Combobox(f_row2, state="readonly", width=20)
+        self.combo_bench.pack(side=tk.LEFT, padx=10)
+        tk.Button(f_sel, text="🔄 刷新", command=self.load_dates).pack(side=tk.RIGHT, padx=10)
+
+        # 🟢 [修改] 增加战报模式选择器
+        f_filter = tk.Frame(f_sel)
+        f_filter.pack(fill="x", pady=5)
+        tk.Label(f_filter, text="3. 战报模式:", width=15, anchor="e").pack(side=tk.LEFT)
+        self.report_mode = tk.StringVar(value="ALL")
+        tk.Radiobutton(f_filter, text="📋 完整榜单 (全部存活)", variable=self.report_mode, value="ALL").pack(
+            side=tk.LEFT, padx=10)
+        tk.Radiobutton(f_filter, text="🔥 飙升榜 (仅看上升)", variable=self.report_mode, value="RISING").pack(
+            side=tk.LEFT, padx=10)
+
+        f_btns = tk.Frame(frame)
+        f_btns.pack(fill="x", pady=20)
+        tk.Button(f_btns, text="🖼️ 生成趋势战报 (Chrome)", bg="#9C27B0", fg="white", font=("微软雅黑", 12, "bold"),
+                  command=self.show_visual_report).pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        tk.Button(f_btns, text="📊 生成全量 Excel 报表", bg="#2196F3", fg="white", font=("微软雅黑", 12, "bold"),
+                  command=self.run_excel_report).pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+
+    # ================= Tab 3: 品类风向标 =================
+    def setup_tab3(self):
+        frame = tk.Frame(self.tab3, padx=20, pady=20)
+        frame.pack(fill="both", expand=True)
+        f_header = tk.Frame(frame)
+        f_header.pack(fill="x", pady=10)
+        tk.Label(f_header, text="📊 热销品类风向标", font=("微软雅黑", 16, "bold"), fg="#009688").pack(side=tk.LEFT)
+        tk.Label(f_header, text="   | 分析目标:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+
+        self.cat_analyze_type = tk.StringVar(value="NEW")
+        tk.Radiobutton(f_header, text="新品榜", variable=self.cat_analyze_type, value="NEW",
+                       command=self.load_dates_tab3).pack(side=tk.LEFT)
+        tk.Radiobutton(f_header, text="热销榜", variable=self.cat_analyze_type, value="HOT",
+                       command=self.load_dates_tab3).pack(side=tk.LEFT)
+        tk.Radiobutton(f_header, text="MOTF (高端)", variable=self.cat_analyze_type, value="MOTF",
+                       command=self.load_dates_tab3, fg="#9C27B0").pack(side=tk.LEFT)
+
+        f_sel = tk.Frame(frame)
+        f_sel.pack(fill="x", pady=10)
+        tk.Label(f_sel, text="分析日期 (Day 3):").pack(side=tk.LEFT)
+        self.combo_cat_date = ttk.Combobox(f_sel, state="readonly", width=20)
+        self.combo_cat_date.pack(side=tk.LEFT, padx=10)
+        tk.Button(f_sel, text="🚀 分析板块趋势", bg="#009688", fg="white", font=("微软雅黑", 10, "bold"),
+                  command=self.run_category_analysis).pack(side=tk.LEFT)
+        columns = ("rank", "category", "count", "percent", "avg_price")
+        self.tree_cat = ttk.Treeview(frame, columns=columns, show="headings", height=15)
+        self.tree_cat.heading("rank", text="排名")
+        self.tree_cat.heading("category", text="品类板块")
+        self.tree_cat.heading("count", text="上升款数量")
+        self.tree_cat.heading("percent", text="占比")
+        self.tree_cat.heading("avg_price", text="均价 ($)")
+        self.tree_cat.column("rank", width=50, anchor="center")
+        self.tree_cat.column("category", width=150, anchor="center")
+        self.tree_cat.column("count", width=100, anchor="center")
+        self.tree_cat.column("percent", width=80, anchor="center")
+        self.tree_cat.column("avg_price", width=80, anchor="center")
+        self.tree_cat.pack(fill="both", expand=True, pady=10)
+        self.root.after(1200, self.load_dates_tab3)
+
+    # ================= 公共逻辑 =================
+    def load_dates(self):
+        if not self.engine: return
+        target_type = self.analyze_type.get()
+        try:
+            with self.engine.connect() as conn:
+                res = conn.execute(text(
+                    "SELECT DISTINCT record_date FROM daily_rankings WHERE data_type = :t ORDER BY record_date DESC"),
+                                   {"t": target_type})
+                dates = [str(r[0]) for r in res]
+                self.combo_target['values'] = dates
+                self.combo_bench['values'] = dates
+                if dates:
+                    self.combo_target.current(0)
+                    self.auto_match_benchmark()
+        except:
+            pass
+
+    def load_dates_tab3(self):
+        if not self.engine: return
+        target_type = self.cat_analyze_type.get()
+        try:
+            with self.engine.connect() as conn:
+                res = conn.execute(text(
+                    "SELECT DISTINCT record_date FROM daily_rankings WHERE data_type = :t ORDER BY record_date DESC"),
+                                   {"t": target_type})
+                dates = [str(r[0]) for r in res]
+                self.combo_cat_date['values'] = dates
+                if dates: self.combo_cat_date.current(0)
+        except:
+            pass
+
+    def auto_match_benchmark(self, event=None):
+        target_str = self.combo_target.get()
+        target_type = self.analyze_type.get()
+        if not target_str: return
+        curr = datetime.datetime.strptime(target_str, '%Y-%m-%d').date()
+        best_match = None
+        with self.engine.connect() as conn:
+            for i in range(2, 8):
+                d = curr - datetime.timedelta(days=i)
+                res = conn.execute(
+                    text("SELECT COUNT(*) FROM daily_rankings WHERE record_date = :d AND data_type = :t"),
+                    {"d": d, "t": target_type})
+                if res.scalar() > 0:
+                    best_match = str(d)
+                    break
+        if best_match and best_match in self.combo_bench['values']: self.combo_bench.set(best_match)
+
+    def get_analysis_data(self):
+        target_date = self.combo_target.get()
+        bench_date = self.combo_bench.get()
+        d_type = self.analyze_type.get()
+        if not target_date or not bench_date: return None, None, None
+        if target_date == bench_date: return None, None, None
+        query = text("SELECT * FROM daily_rankings WHERE record_date = :d AND data_type = :t")
+        df_new = pd.read_sql(query, self.engine, params={"d": target_date, "t": d_type})
+        df_old = pd.read_sql(query, self.engine, params={"d": bench_date, "t": d_type})
+        if df_new.empty or df_old.empty:
+            messagebox.showwarning("数据为空", f"在 {d_type} 榜单中未找到对应日期数据")
+            return None, None, None
+        surv = set(df_new['img_url']) & set(df_old['img_url'])
+        df_surv = df_new[df_new['img_url'].isin(surv)].copy()
+        old_rank = df_old.set_index('img_url')['rank_index'].to_dict()
+        df_surv['昨日排名'] = df_surv['img_url'].map(old_rank)
+        df_surv['排名变化'] = df_surv['昨日排名'] - df_surv['rank_index']
+        # 按最新排名排序
+        df_surv.sort_values('rank_index', ascending=True, inplace=True)
+        return df_surv, df_new, df_old
+
+    def open_chrome_url(self, url):
+        if not url: return
+        chrome_path = None
+        for path in POSSIBLE_CHROME_PATHS:
+            if os.path.exists(path):
+                chrome_path = path
+                break
+        try:
+            if chrome_path:
+                webbrowser.register('chrome', None, webbrowser.BackgroundBrowser(chrome_path))
+                webbrowser.get('chrome').open(url)
+            else:
+                webbrowser.open(url)
+        except:
+            webbrowser.open(url)
+
+    # 🟢 [修改] 视觉战报现在支持模式选择
+    def show_visual_report(self):
+        df_surv, _, _ = self.get_analysis_data()
+        if df_surv is None: return
+
+        mode = self.report_mode.get()  # 获取用户选择的模式
+
+        if mode == "RISING":
+            df_display = df_surv[df_surv['排名变化'] > 0].copy()  # 仅看上升
+            title_prefix = "🔥 飙升榜"
+        else:
+            df_display = df_surv.copy()  # 看全部
+            title_prefix = "📋 完整榜单"
+
+        if df_display.empty: return messagebox.showinfo("提示", "该模式下无匹配产品")
+
+        top_items = df_display.to_dict('records')
+        d_type = self.analyze_type.get()
+        title_txt = f"{title_prefix} - {d_type} ({len(top_items)}款)"
+
+        win = Toplevel(self.root)
+        win.title(title_txt)
+        win.geometry("1000x900")
+        canvas = tk.Canvas(win)
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _mw(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _mw)
+
+        def load_images():
+            idx = 0
+            for item in top_items:
+                card = tk.Frame(scrollable_frame, bd=2, relief=tk.GROOVE, padx=10, pady=10)
+                card.pack(fill="x", padx=10, pady=10)
+                l_img = tk.Label(card, text="Wait...", bg="#eee")
+                l_img.pack(side=tk.LEFT, padx=10)
+                u_img = item.get('img_url')
+                u_det = item.get('detail_url')
+                if u_img:
+                    l_img.bind("<Button-1>", lambda e, u=u_img: self.open_chrome_url(u))
+                    l_img.config(cursor="hand2")
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    r = requests.get(u_img, headers=headers, timeout=3)
+                    pil = Image.open(io.BytesIO(r.content))
+                    wp = 190 / float(pil.size[0])
+                    hs = int((float(pil.size[1]) * float(wp)))
+                    pil = pil.resize((190, hs))
+                    tk_i = ImageTk.PhotoImage(pil)
+                    l_img.config(image=tk_i, text="");
+                    l_img.image = tk_i
+                except:
+                    l_img.config(text="Err")
+
+                f_inf = tk.Frame(card)
+                f_inf.pack(side=tk.LEFT, fill="both", expand=True)
+
+                change = int(item['排名变化'])
+                if change > 0:
+                    status_text = f"🔥 排名飙升 (+{change})"
+                    status_color = "red"
+                elif change == 0:
+                    status_text = f"➖ 排名持平"
+                    status_color = "black"
+                else:
+                    status_text = f"📉 排名下降 ({change})"
+                    status_color = "green"
+
+                tk.Label(f_inf, text=f"No.{idx + 1} | {status_text}", fg=status_color, font=("Bold", 14)).pack(
+                    anchor="w")
+                tk.Label(f_inf, text=item['title'], wraplength=400, justify="left").pack(anchor="w")
+                tk.Label(f_inf,
+                         text=f"${item['price']} | 排名走势: {int(item['昨日排名'])} ➔ {int(item['rank_index'])}",
+                         font=("Bold", 12)).pack(anchor="w")
+                if u_det:
+                    l_lk = tk.Label(f_inf, text="跳转详情页", fg="blue", cursor="hand2")
+                    l_lk.pack(anchor="w", pady=10)
+                    l_lk.bind("<Button-1>", lambda e, u=u_det: self.open_chrome_url(u))
+                idx += 1
+
+        threading.Thread(target=load_images, daemon=True).start()
+
+    def run_excel_report(self):
+        df_surv, df_new, df_old = self.get_analysis_data()
+        if df_surv is None: return
+        target = self.combo_target.get()
+        d_type = self.analyze_type.get()
+        fname = f"【{d_type}榜】全量存活分析_{target}.xlsx"
+        path = os.path.join(DEFAULT_SAVE_DIR, fname)
+        df_surv['上升幅度(%)'] = df_surv.apply(
+            lambda x: f"{round((x['排名变化'] / x['昨日排名']) * 100, 1)}%" if x['昨日排名'] > 0 else "N/A", axis=1)
+        with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            cols = ['排名变化', '上升幅度(%)', 'rank_index', '昨日排名', 'price', 'img_url', '图片预览', 'title']
+            df_surv['图片预览'] = [f'=IMAGE(F{i + 2})' for i in range(len(df_surv))]
+            df_surv[cols].to_excel(writer, sheet_name='🔥全量存活款', index=False)
+        messagebox.showinfo("完成", f"全量报表已生成: {fname}")
+
+    def run_category_analysis(self):
+        target_date = self.combo_cat_date.get()
+        d_type = self.cat_analyze_type.get()
+        if not target_date: return
+        curr = datetime.datetime.strptime(target_date, '%Y-%m-%d').date()
+        bench_date = None
+        with self.engine.connect() as conn:
+            for i in range(2, 8):
+                d = curr - datetime.timedelta(days=i)
+                res = conn.execute(
+                    text("SELECT COUNT(*) FROM daily_rankings WHERE record_date = :d AND data_type = :t"),
+                    {"d": d, "t": d_type})
+                if res.scalar() > 0: bench_date = d; break
+        if not bench_date: return messagebox.showwarning("提示", "无对比基准")
+        query = text(
+            "SELECT title, price, img_url, rank_index FROM daily_rankings WHERE record_date = :d AND data_type = :t")
+        try:
+            df_new = pd.read_sql(query, self.engine, params={"d": target_date, "t": d_type})
+            df_old = pd.read_sql(query, self.engine, params={"d": bench_date, "t": d_type})
+            surv = set(df_new['img_url']) & set(df_old['img_url'])
+            df_surv = df_new[df_new['img_url'].isin(surv)].copy()
+            old_rank = df_old.set_index('img_url')['rank_index'].to_dict()
+            df_surv['diff'] = df_surv['img_url'].map(old_rank) - df_surv['rank_index']
+            df_rising = df_surv[df_surv['diff'] > 0].copy()
+            if df_rising.empty: return messagebox.showinfo("提示", "无上升款")
+            cat_stats = {k: {'count': 0, 'prices': []} for k in CATEGORY_MAP.keys()}
+            cat_stats['Others'] = {'count': 0, 'prices': []}
+            for _, row in df_rising.iterrows():
+                title = str(row['title']).lower()
+                price = float(row['price'])
+                found = False
+                for cat, kws in CATEGORY_MAP.items():
+                    for kw in kws:
+                        if kw in title:
+                            cat_stats[cat]['count'] += 1
+                            cat_stats[cat]['prices'].append(price)
+                            found = True
+                            break
+                    if found: break
+                if not found:
+                    cat_stats['Others']['count'] += 1
+                    cat_stats['Others']['prices'].append(price)
+            final = []
+            total = len(df_rising)
+            for cat, dat in cat_stats.items():
+                if dat['count'] > 0:
+                    avg = sum(dat['prices']) / dat['count']
+                    pct = (dat['count'] / total) * 100
+                    final.append((cat, dat['count'], f"{pct:.1f}%", f"${avg:.2f}"))
+            final.sort(key=lambda x: x[1], reverse=True)
+            for i in self.tree_cat.get_children(): self.tree_cat.delete(i)
+            for idx, item in enumerate(final): self.tree_cat.insert("", "end", values=(idx + 1, *item))
+        except Exception as e:
+            messagebox.showerror("Err", str(e))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SheinDBMaster(root)
+    root.mainloop()
